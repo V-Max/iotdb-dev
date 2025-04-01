@@ -185,45 +185,73 @@ public class Coordinator {
   }
 
   private ExecutionResult execution(
-      long queryId,
-      SessionInfo session,
-      String sql,
-      boolean userQuery,
-      BiFunction<MPPQueryContext, Long, IQueryExecution> iQueryExecutionFactory) {
+          long queryId,
+          SessionInfo session,
+          String sql,
+          boolean userQuery,
+          BiFunction<MPPQueryContext, Long, IQueryExecution> iQueryExecutionFactory) {
+    // 核心执行方法
+    // queryId: 查询ID
+    // session: 会话信息
+    // sql: SQL语句
+    // userQuery: 是否是用户查询
+    // iQueryExecutionFactory: 查询执行器工厂函数
+
+    // 记录开始时间
     long startTime = System.currentTimeMillis();
+
+    // 生成全局查询ID
     QueryId globalQueryId = queryIdGenerator.createNextQueryId();
     MPPQueryContext queryContext = null;
+
     try (SetThreadName queryName = new SetThreadName(globalQueryId.getId())) {
+      // 打印调试日志
       if (sql != null && !sql.isEmpty()) {
         LOGGER.debug("[QueryStart] sql: {}", sql);
       }
-      queryContext =
-          new MPPQueryContext(
+
+      // 创建查询上下文
+      queryContext = new MPPQueryContext(
               sql,
               globalQueryId,
               queryId,
               session,
               DataNodeEndPoints.LOCAL_HOST_DATA_BLOCK_ENDPOINT,
               DataNodeEndPoints.LOCAL_HOST_INTERNAL_ENDPOINT);
+
+      // 设置是否为用户查询
       queryContext.setUserQuery(userQuery);
+
+      // 创建查询执行器
       IQueryExecution execution = iQueryExecutionFactory.apply(queryContext, startTime);
+
+      // 如果是查询操作,将执行器加入map中
       if (execution.isQuery()) {
         queryExecutionMap.put(queryId, execution);
       } else {
-        // we won't limit write operation's execution time
+        // 写操作不限制执行时间
         queryContext.setTimeOut(Long.MAX_VALUE);
       }
+
+      // 开始执行
       execution.start();
+
+      // 获取执行状态
       ExecutionResult result = execution.getStatus();
+
+      // 处理写请求的重试逻辑
       if (!execution.isQuery() && result.status != null && needRetry(result.status)) {
-        // if it's write request and the result status needs to retry
         result.status.setNeedRetry(true);
       }
+
       return result;
+
     } finally {
+      // 释放前端预留的内存
       if (queryContext != null) {
         queryContext.releaseAllMemoryReservedForFrontEnd();
       }
+      // 释放schema锁
       DataNodeSchemaLockManager.getInstance().releaseReadLock(queryContext);
     }
   }
@@ -249,6 +277,15 @@ public class Coordinator {
       ISchemaFetcher schemaFetcher,
       long timeOut,
       boolean userQuery) {
+    // 执行树模型查询的方法
+    // statement: SQL语句解析后的语法树
+    // queryId: 查询ID
+    // session: 会话信息
+    // sql: 原始SQL语句
+    // partitionFetcher: 分区获取器
+    // schemaFetcher: schema获取器
+    // timeOut: 超时时间
+    // userQuery: 是否是用户查询
     return execution(
         queryId,
         session,

@@ -822,51 +822,69 @@ public class StatementGenerator {
   }
 
   private static Statement invokeParser(String sql, ZoneId zoneId) {
+    // 记录开始时间,用于性能统计
     long startTime = System.nanoTime();
     try {
+      // 创建AST访问器,设置时区
       ASTVisitor astVisitor = new ASTVisitor();
       astVisitor.setZoneId(zoneId);
 
+      // 第一阶段: SLL(*) 解析
+      // 从SQL字符串创建字符流
       CharStream charStream1 = CharStreams.fromString(sql);
 
+      // 创建词法分析器
       SqlLexer lexer1 = new SqlLexer(charStream1);
+      // 移除默认错误监听器
       lexer1.removeErrorListeners();
+      // 添加自定义错误监听器
       lexer1.addErrorListener(SqlParseError.INSTANCE);
 
+      // 创建词法符号流
       CommonTokenStream tokens1 = new CommonTokenStream(lexer1);
 
+      // 创建语法分析器
       IoTDBSqlParser parser1 = new IoTDBSqlParser(tokens1);
+      // 设置SLL预测模式(更快但功能较弱)
       parser1.getInterpreter().setPredictionMode(PredictionMode.SLL);
+      // 移除默认错误监听器
       parser1.removeErrorListeners();
+      // 添加自定义错误监听器
       parser1.addErrorListener(SqlParseError.INSTANCE);
 
       ParseTree tree;
       try {
-        // STAGE 1: try with simpler/faster SLL(*)
+        // 尝试使用SLL模式解析单条语句
         tree = parser1.singleStatement();
-        // if we get here, there was no syntax error and SLL(*) was enough; there is no need to try
-        // full LL(*)
+        // 如果成功,说明语法正确且SLL模式足够处理
       } catch (Exception ex) {
+        // SLL模式解析失败,切换到LL模式重试
+
+        // 重新创建字符流
         CharStream charStream2 = CharStreams.fromString(sql);
 
+        // 重新创建词法分析器
         SqlLexer lexer2 = new SqlLexer(charStream2);
         lexer2.removeErrorListeners();
         lexer2.addErrorListener(SqlParseError.INSTANCE);
 
+        // 重新创建词法符号流
         CommonTokenStream tokens2 = new CommonTokenStream(lexer2);
 
-        org.apache.iotdb.db.qp.sql.IoTDBSqlParser parser2 =
-            new org.apache.iotdb.db.qp.sql.IoTDBSqlParser(tokens2);
+        // 重新创建语法分析器
+        IoTDBSqlParser parser2 = new IoTDBSqlParser(tokens2);
+        // 设置为完整LL预测模式
         parser2.getInterpreter().setPredictionMode(PredictionMode.LL);
         parser2.removeErrorListeners();
         parser2.addErrorListener(SqlParseError.INSTANCE);
 
-        // STAGE 2: parser with full LL(*)
+        // 使用LL模式解析
         tree = parser2.singleStatement();
-        // if we get here, it's LL not SLL
       }
+      // 使用访问器访问语法树,生成Statement对象
       return astVisitor.visit(tree);
     } finally {
+      // 记录解析耗时
       PERFORMANCE_OVERVIEW_METRICS.recordParseCost(System.nanoTime() - startTime);
     }
   }

@@ -38,26 +38,29 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BiFunction;
 
 /**
  * This class is used to record the context of a query including QueryId, query statement, session
  * info and so on.
  */
 public class MPPQueryContext {
-  private String sql;
-  private final QueryId queryId;
+  // 查询相关的属性
+  private String sql; // SQL语句
+  private final QueryId queryId; // 查询ID
 
   // LocalQueryId is kept to adapt to the old client, it's unique in current datanode.
   // Now it's only be used by EXPLAIN ANALYZE to get queryExecution.
-  private long localQueryId;
-  private SessionInfo session;
-  private QueryType queryType = QueryType.READ;
-  private long timeOut;
-  private long startTime;
+  private long localQueryId; // 本地查询ID
+  private SessionInfo session; // 会话信息
+  private QueryType queryType = QueryType.READ; // 查询类型
+  private long timeOut; // 超时时间
+  private long startTime; // 开始时间
+  // 节点相关的属性
+  private TEndPoint localDataBlockEndpoint;// 本地数据块端点
+  private TEndPoint localInternalEndpoint;// 本地内部端点
+  private ResultNodeContext resultNodeContext;// 结果节点上下文
 
-  private TEndPoint localDataBlockEndpoint;
-  private TEndPoint localInternalEndpoint;
-  private ResultNodeContext resultNodeContext;
 
   // Main FragmentInstance, the other FragmentInstance should push data result to this
   // FragmentInstance
@@ -76,11 +79,11 @@ public class MPPQueryContext {
 
   private boolean isExplainAnalyze = false;
 
-  QueryPlanStatistics queryPlanStatistics = null;
+  QueryPlanStatistics queryPlanStatistics = null; // 查询计划统计
 
   // To avoid query front-end from consuming too much memory, it needs to reserve memory when
   // constructing some Expression and PlanNode.
-  private final MemoryReservationManager memoryReservationManager;
+  private final MemoryReservationManager memoryReservationManager; // 内存预留管理器
 
   private boolean userQuery = false;
 

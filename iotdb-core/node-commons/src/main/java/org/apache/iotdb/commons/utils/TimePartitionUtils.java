@@ -44,6 +44,10 @@ public class TimePartitionUtils {
 
   public static long getTimePartitionUpperBound(long time) {
     long upperBoundOfTimePartition;
+    if (time >= Long.MAX_VALUE - TimePartitionUtils.timePartitionInterval) {
+      System.out.println("边界检查：接近Long.MAX_VALUE，直接返回Long.MAX_VALUE");
+      return Long.MAX_VALUE;
+    }
     if (time > 0 || time % TimePartitionUtils.timePartitionInterval == 0) {
       upperBoundOfTimePartition =
           (time / TimePartitionUtils.timePartitionInterval + 1)

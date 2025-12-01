@@ -274,144 +274,201 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
     return analysis;
   }
 
+  /*
+  * 负责将SQL查询语句转换为可执行的内部表示。作为查询优化器的前置步骤，
+  * 它完成了从语法分析到执行计划生成之间的所有语义分析、路径解析、过滤器提取、聚合分析等关键工作
+  * */
   @Override
   public Analysis visitQuery(QueryStatement queryStatement, MPPQueryContext context) {
+    // 创建一个新的Analysis对象，用于存储查询分析的结果
+    // Analysis对象是整个查询分析阶段的核心数据结构，保存了所有分析结果供后续优化和执行使用
+
     Analysis analysis = new Analysis();
+    // 记录查询语句是否在最后一级使用了通配符（如`root.sg.*`）
     analysis.setLastLevelUseWildcard(queryStatement.isLastLevelUseWildcard());
 
     try {
-      // check for semantic errors
+      // 执行查询语句的语义检查，验证SQL语法和语义的正确性
       queryStatement.semanticCheck();
 
-      // fetch model inference information and check
+      // 分析模型推理相关信息（如果查询中包含模型推理操作）
+      // IoT数据库特有的功能，用于处理与AI模型相关的查询
       analyzeModelInference(analysis, queryStatement);
 
+      // 分析查询涉及的模式树（SchemaTree），用于后续处理
       ISchemaTree schemaTree = analyzeSchema(queryStatement, analysis, context);
 
-      // If there is no leaf node in the schema tree, the query should be completed immediately
+      // 如果模式树中没有叶节点（没有匹配的数据），立即完成查询
       if (schemaTree.isEmpty()) {
         return finishQuery(queryStatement, analysis);
       }
 
-      // extract global time filter from query filter and determine if there is a value filter
+      // 从查询过滤器中提取全局时间过滤器，并确定是否存在值过滤器
       analyzeGlobalTimeFilter(analysis, queryStatement);
 
+      // 如果是last查询（查询最新数据），进行特殊处理
       if (queryStatement.isLastQuery()) {
         return analyzeLastQuery(queryStatement, analysis, schemaTree, context);
       }
 
+      // 声明输出表达式列表，用于存储查询结果的表达式
       List<Pair<Expression, String>> outputExpressions;
+
+      // 检查是否按设备对齐（AlignByDevice）模式
       if (queryStatement.isAlignByDevice()) {
+        // 尝试使用查询模板优化查询性能
+        // 如果查询可以匹配预定义的模板，则直接返回分析结果，跳过后续复杂分析
         if (TemplatedAnalyze.canBuildPlanUseTemplate(
-            analysis, queryStatement, partitionFetcher, schemaTree, context)) {
+                analysis, queryStatement, partitionFetcher, schemaTree, context)) {
           return analysis;
         }
 
+        // 分析FROM子句，获取设备列表
         List<PartialPath> deviceList = analyzeFrom(queryStatement, schemaTree);
 
+        // 检查是否可以在按时间分组的情况下下推Limit/Offset操作，优化性能
         if (canPushDownLimitOffsetInGroupByTimeForDevice(queryStatement)) {
-          // remove the device which won't appear in resultSet after limit/offset
+          // 移除那些在应用limit/offset后不会出现在结果集中的设备
           deviceList = pushDownLimitOffsetInGroupByTimeForDevice(deviceList, queryStatement);
         }
 
+        // 分析SELECT子句，获取输出表达式
         outputExpressions =
-            analyzeSelect(analysis, queryStatement, schemaTree, deviceList, context);
+                analyzeSelect(analysis, queryStatement, schemaTree, deviceList, context);
+        // 如果没有输出表达式，立即完成查询
         if (outputExpressions.isEmpty()) {
           return finishQuery(queryStatement, analysis);
         }
 
+        // 分析WHERE子句并将条件应用到设备列表
         analyzeDeviceToWhere(analysis, queryStatement, schemaTree, deviceList, context);
+        // 如果设备列表为空，立即完成查询
         if (deviceList.isEmpty()) {
           return finishQuery(queryStatement, analysis, outputExpressions);
         }
+        // 将过滤后的设备列表保存到分析对象中
         analysis.setDeviceList(deviceList);
 
+        // 分析GROUP BY子句并应用到设备级别
         analyzeDeviceToGroupBy(analysis, queryStatement, schemaTree, deviceList, context);
+        // 分析ORDER BY子句并应用到设备级别
         analyzeDeviceToOrderBy(analysis, queryStatement, schemaTree, deviceList, context);
+        // 分析HAVING子句并应用到设备级别
         analyzeHaving(analysis, queryStatement, schemaTree, deviceList, context);
 
+        // 分析设备级别的聚合操作
         analyzeDeviceToAggregation(analysis, queryStatement);
+        // 分析设备级别的源转换操作
         analyzeDeviceToSourceTransform(analysis, queryStatement);
+        // 分析设备级别的数据源操作
         analyzeDeviceToSource(analysis, queryStatement);
 
+        // 分析设备视图的输出
         analyzeDeviceViewOutput(analysis, queryStatement);
+        // 分析设备视图的输入
         analyzeDeviceViewInput(analysis, queryStatement);
 
+        // 分析INTO子句，处理查询结果的输出目标
         analyzeInto(analysis, queryStatement, deviceList, outputExpressions, context);
       } else {
-        // analyze output expressions
-        if (queryStatement.isGroupByLevel()) {
-          GroupByLevelHelper groupByLevelHelper =
-              new GroupByLevelHelper(queryStatement.getGroupByLevelComponent().getLevels());
+        // 非按设备对齐模式的处理
 
+        // 如果是按级别分组（GroupByLevel）
+        if (queryStatement.isGroupByLevel()) {
+          // 创建一个级别分组助手对象
+          GroupByLevelHelper groupByLevelHelper =
+                  new GroupByLevelHelper(queryStatement.getGroupByLevelComponent().getLevels());
+
+          // 分析SELECT子句，考虑级别分组
           outputExpressions =
-              analyzeGroupByLevelSelect(
-                  analysis, queryStatement, schemaTree, groupByLevelHelper, context);
+                  analyzeGroupByLevelSelect(
+                          analysis, queryStatement, schemaTree, groupByLevelHelper, context);
+          // 如果没有输出表达式，立即完成查询
           if (outputExpressions.isEmpty()) {
             return finishQuery(queryStatement, analysis);
           }
+          // 设置输出表达式
           analysis.setOutputExpressions(outputExpressions);
           setSelectExpressions(analysis, queryStatement, outputExpressions);
 
+          // 分析HAVING子句，考虑级别分组
           analyzeGroupByLevelHaving(
-              analysis, queryStatement, schemaTree, groupByLevelHelper, context);
+                  analysis, queryStatement, schemaTree, groupByLevelHelper, context);
 
+          // 分析ORDER BY子句，考虑级别分组
           analyzeGroupByLevelOrderBy(
-              analysis, queryStatement, schemaTree, groupByLevelHelper, context);
+                  analysis, queryStatement, schemaTree, groupByLevelHelper, context);
 
+          // 检查级别分组表达式中的数据类型一致性
           checkDataTypeConsistencyInGroupByLevel(
-              analysis, groupByLevelHelper.getGroupByLevelExpressions());
+                  analysis, groupByLevelHelper.getGroupByLevelExpressions());
+          // 设置跨级别分组表达式
           analysis.setCrossGroupByExpressions(groupByLevelHelper.getGroupByLevelExpressions());
         } else {
+          // 普通查询模式
+          // 分析SELECT子句，获取输出表达式
           outputExpressions = analyzeSelect(analysis, queryStatement, schemaTree, context);
 
+          // 分析按标签分组（GroupByTag）
           analyzeGroupByTag(analysis, queryStatement, outputExpressions);
 
+          // 如果没有输出表达式，立即完成查询
           if (outputExpressions.isEmpty()) {
             return finishQuery(queryStatement, analysis);
           }
+          // 设置输出表达式
           analysis.setOutputExpressions(outputExpressions);
           setSelectExpressions(analysis, queryStatement, outputExpressions);
 
+          // 分析HAVING子句
           analyzeHaving(analysis, queryStatement, schemaTree, context);
 
+          // 分析ORDER BY子句
           analyzeOrderBy(analysis, queryStatement, schemaTree, context);
         }
 
-        // analyze aggregation
+        // 分析聚合操作
         analyzeAggregation(analysis, queryStatement);
 
-        // analyze aggregation input
+        // 分析GROUP BY子句
         analyzeGroupBy(analysis, queryStatement, schemaTree, context);
+        // 分析WHERE子句
         analyzeWhere(analysis, queryStatement, schemaTree, context);
+        // 如果WHERE条件是恒假（FALSE），立即完成查询
         if (analysis.getWhereExpression() != null
-            && analysis.getWhereExpression().equals(ConstantOperand.FALSE)) {
+                && analysis.getWhereExpression().equals(ConstantOperand.FALSE)) {
           return finishQuery(queryStatement, analysis, outputExpressions);
         }
+        // 分析源转换操作
         analyzeSourceTransform(analysis, outputExpressions, queryStatement);
 
-        // analyze series scan
+        // 分析数据源（series scan）
         analyzeSource(analysis, queryStatement);
 
-        // analyze into paths
+        // 分析INTO子句，处理查询结果的输出目标
         analyzeInto(analysis, queryStatement, outputExpressions, context);
       }
 
+      // 分析按时间分组（GroupByTime）
       analyzeGroupByTime(analysis, queryStatement);
+      // 生成全局时间过滤器
       context.generateGlobalTimeFilter(analysis);
 
+      // 分析填充操作（Fill）
       analyzeFill(analysis, queryStatement);
 
-      // generate result set header according to output expressions
+      // 根据输出表达式生成结果集头部信息
       analyzeOutput(analysis, queryStatement, outputExpressions);
 
-      // fetch partition information
+      // 获取分区信息
       analyzeDataPartition(analysis, queryStatement, schemaTree, context);
 
     } catch (StatementAnalyzeException e) {
+      // 捕获并重新抛出查询语句分析过程中的异常，添加更详细的错误信息
       throw new StatementAnalyzeException(
-          "Meet error when analyzing the query statement: " + e.getMessage());
+              "Meet error when analyzing the query statement: " + e.getMessage());
     }
+    // 返回分析结果
     return analysis;
   }
 
@@ -551,31 +608,59 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
     return analysis;
   }
 
+  /*
+  * 主要负责从SQL查询语句的WHERE子句中提取全局时间过滤器（Global Time Filter），
+  * 初始化是否有值过滤，
+  * 这是查询优化和执行计划生成的关键步骤。
+  * */
   private void analyzeGlobalTimeFilter(Analysis analysis, QueryStatement queryStatement) {
+    // 初始化全局时间谓词变量为null
     Expression globalTimePredicate = null;
+    // 初始化是否有值过滤器的标志为false
     boolean hasValueFilter = false;
+
+    // 检查查询语句是否包含WHERE条件
     if (queryStatement.getWhereCondition() != null) {
+      // 获取WHERE条件对象
       WhereCondition whereCondition = queryStatement.getWhereCondition();
+      // 获取WHERE条件中的谓词表达式
       Expression predicate = whereCondition.getPredicate();
 
+      // 从谓词表达式中提取全局时间谓词
+      // 参数说明：
+      // - predicate: 原始谓词表达式
+      // - true: 是否允许使用时间戳作为时间过滤器
+      // - true: 是否允许使用时间戳函数作为时间过滤器
       Pair<Expression, Boolean> resultPair =
-          PredicateUtils.extractGlobalTimePredicate(predicate, true, true);
+              PredicateUtils.extractGlobalTimePredicate(predicate, true, true);
+
+      // 从结果对中获取提取出的全局时间谓词
       globalTimePredicate = resultPair.left;
+
+      // 如果存在全局时间谓词，则移除其中的NOT操作符
       if (globalTimePredicate != null) {
         globalTimePredicate = PredicateUtils.predicateRemoveNot(globalTimePredicate);
       }
+
+      // 从结果对中获取是否包含值过滤器的标志
       hasValueFilter = resultPair.right;
 
+      // 对原始谓词表达式进行简化处理
       predicate = PredicateUtils.simplifyPredicate(predicate);
 
-      // set where condition to null if predicate is true or time filter.
+      // 如果不存在值过滤器或者简化后的谓词是恒真表达式，则将WHERE条件设置为null
+      // 这意味着查询不需要额外的值过滤，可以仅依赖时间过滤
       if (!hasValueFilter || predicate.equals(ConstantOperand.TRUE)) {
         queryStatement.setWhereCondition(null);
       } else {
+        // 否则，保留WHERE条件并更新其谓词为简化后的表达式
         whereCondition.setPredicate(predicate);
       }
     }
+
+    // 将提取的全局时间谓词设置到分析结果中
     analysis.setGlobalTimePredicate(globalTimePredicate);
+    // 将是否存在值过滤器的标志设置到分析结果中
     analysis.setHasValueFilter(hasValueFilter);
   }
 
@@ -2152,53 +2237,109 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
             fillComponent.getTimeDurationThreshold()));
   }
 
+  /**
+   * 分析查询相关的数据分区信息，为查询执行准备分区元数据
+   * 数据分区决定了数据在分布式系统中的存储位置，对查询性能至关重要
+   *
+   * @param analysis 分析结果对象，用于存储查询分析过程中收集的所有信息
+   * @param queryStatement 查询语句对象，包含完整的SQL查询信息
+   * @param schemaTree 模式树对象，包含查询涉及的数据结构信息
+   * @param context 查询上下文，包含查询的全局信息如时间过滤器等
+   */
   private void analyzeDataPartition(
-      Analysis analysis,
-      QueryStatement queryStatement,
-      ISchemaTree schemaTree,
-      MPPQueryContext context) {
+          Analysis analysis,          // 存储查询分析结果的核心数据结构
+          QueryStatement queryStatement,  // 原始查询语句对象
+          ISchemaTree schemaTree,         // 模式树，包含时间序列的元数据信息
+          MPPQueryContext context) {      // 查询上下文，维护查询执行的环境信息
+
+    // 创建设备集合，用于存储本次查询涉及的所有设备路径
     Set<String> deviceSet = new HashSet<>();
+
+    // 根据查询类型确定如何获取设备集合
     if (queryStatement.isAlignByDevice()) {
+      // 按设备对齐模式：从输出设备到查询设备的映射中获取所有设备路径
+      // 这种模式下查询是按设备组织结果的
       deviceSet = new HashSet<>(analysis.getOutputDeviceToQueriedDevicesMap().values());
     } else {
+      // 非按设备对齐模式：从源表达式中提取设备名称
+      // 遍历所有源表达式，获取每个表达式对应的设备名
       for (Expression expression : analysis.getSourceExpressions()) {
         deviceSet.add(ExpressionAnalyzer.getDeviceNameInSourceExpression(expression));
       }
     }
+
+    // 核心操作：根据设备集合获取数据分区信息
     DataPartition dataPartition = fetchDataPartitionByDevices(deviceSet, schemaTree, context);
+
+    // 将获取到的数据分区信息设置到分析结果对象中，供后续查询执行使用
     analysis.setDataPartitionInfo(dataPartition);
   }
 
+  /**
+   * 根据设备集合获取数据分区信息
+   * 这是查询计划生成过程中的关键步骤，决定了查询数据的物理位置
+   *
+   * @param deviceSet 需要查询的设备路径集合
+   * @param schemaTree 模式树，用于获取设备所属的数据库信息
+   * @param context 查询上下文，包含全局时间过滤器等信息
+   * @return 返回数据分区对象，包含数据在分布式系统中的分区信息
+   */
   private DataPartition fetchDataPartitionByDevices(
-      Set<String> deviceSet, ISchemaTree schemaTree, MPPQueryContext context) {
+          Set<String> deviceSet,      // 查询涉及的所有设备路径集合
+          ISchemaTree schemaTree,     // 模式树，提供设备到数据库的映射
+          MPPQueryContext context) {  // 查询上下文
+
+    // 记录操作开始时间，用于性能监控
     long startTime = System.nanoTime();
     try {
+      // 获取时间分区槽列表和相关标志
+      // res.left: 时间分区槽列表，表示查询涉及的时间范围
+      // res.right.left: 是否包含未闭合的左边界时间范围
+      // res.right.right: 是否包含未闭合的右边界时间范围
       Pair<List<TTimePartitionSlot>, Pair<Boolean, Boolean>> res =
-          getTimePartitionSlotList(context.getGlobalTimeFilter(), context);
-      // there is no satisfied time range
+              getTimePartitionSlotList(context.getGlobalTimeFilter(), context);
+
+      // 判断是否存在满足条件的时间范围
+      // 如果时间分区列表为空且不包含左边界时间范围，则返回空分区
       if (res.left.isEmpty() && Boolean.FALSE.equals(res.right.left)) {
+        // 返回一个空的数据分区对象，使用配置的分区执行器和分区数量
         return new DataPartition(
-            Collections.emptyMap(),
-            CONFIG.getSeriesPartitionExecutorClass(),
-            CONFIG.getSeriesPartitionSlotNum());
-      }
-      Map<String, List<DataPartitionQueryParam>> sgNameToQueryParamsMap = new HashMap<>();
-      for (String devicePath : deviceSet) {
-        DataPartitionQueryParam queryParam =
-            new DataPartitionQueryParam(devicePath, res.left, res.right.left, res.right.right);
-        sgNameToQueryParamsMap
-            .computeIfAbsent(schemaTree.getBelongedDatabase(devicePath), key -> new ArrayList<>())
-            .add(queryParam);
+                Collections.emptyMap(),
+                CONFIG.getSeriesPartitionExecutorClass(),
+                CONFIG.getSeriesPartitionSlotNum());
       }
 
+      // 构建数据库名称到查询参数的映射
+      // 这是为了按数据库分组发送分区查询请求
+      Map<String, List<DataPartitionQueryParam>> sgNameToQueryParamsMap = new HashMap<>();
+
+      // 遍历每个设备路径，为每个设备创建查询参数
+      for (String devicePath : deviceSet) {
+        // 创建数据分区查询参数，包含设备路径和时间分区信息
+        DataPartitionQueryParam queryParam =
+                new DataPartitionQueryParam(devicePath, res.left, res.right.left, res.right.right);
+
+        // 获取设备所属的数据库名称，并将查询参数添加到对应的数据组
+        // computeIfAbsent确保数据库名称对应的列表存在
+        sgNameToQueryParamsMap
+                .computeIfAbsent(schemaTree.getBelongedDatabase(devicePath), key -> new ArrayList<>())
+                .add(queryParam);
+      }
+
+      // 根据是否包含未闭合时间范围选择不同的分区获取策略
       if (res.right.left || res.right.right) {
+        // 如果包含未闭合的时间范围（如> timestamp或< timestamp），使用特殊处理方法
         return partitionFetcher.getDataPartitionWithUnclosedTimeRange(sgNameToQueryParamsMap);
       } else {
+        // 否则使用标准的数据分区获取方法
         return partitionFetcher.getDataPartition(sgNameToQueryParamsMap);
       }
     } finally {
+      // 计算操作耗时，用于性能指标统计
       long partitionFetchCost = System.nanoTime() - startTime;
+      // 记录分区获取的耗时到指标系统
       QueryPlanCostMetricSet.getInstance().recordPlanCost(PARTITION_FETCHER, partitionFetchCost);
+      // 将分区获取耗时保存到查询上下文中
       context.setFetchPartitionCost(partitionFetchCost);
     }
   }

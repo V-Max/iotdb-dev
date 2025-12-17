@@ -1350,30 +1350,41 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
   /** Data Manipulation Language (DML). */
 
   // Select Statement ========================================================================
+  /**
+   * 解析SELECT语句
+   * 实现ANTLR4生成的访问者接口方法，将SQL解析树转换为QueryStatement对象
+   * @param ctx SELECT语句的解析树上下文
+   * @return 解析后的查询语句对象
+   */
   @Override
   public Statement visitSelectStatement(IoTDBSqlParser.SelectStatementContext ctx) {
+    // 创建查询语句对象，用于存储解析结果
     QueryStatement queryStatement = new QueryStatement();
 
-    // parse SELECT & FROM
+    // 解析SELECT子句和FROM子句
     queryStatement.setSelectComponent(parseSelectClause(ctx.selectClause(), queryStatement));
     queryStatement.setFromComponent(parseFromClause(ctx.fromClause()));
 
-    // parse INTO
+    // 解析INTO子句（如果存在）
     if (ctx.intoClause() != null) {
       queryStatement.setIntoComponent(parseIntoClause(ctx.intoClause()));
     }
 
-    // parse WHERE
+    // 解析WHERE子句（如果存在）
     if (ctx.whereClause() != null) {
       queryStatement.setWhereCondition(parseWhereClause(ctx.whereClause()));
     }
 
-    // parse GROUP BY
+    // 解析GROUP BY子句（如果存在）
     if (ctx.groupByClause() != null) {
+      // 用于记录已使用的GROUP BY类型，确保不重复
       Set<String> groupByKeys = new HashSet<>();
       List<IoTDBSqlParser.GroupByAttributeClauseContext> groupByAttributes =
           ctx.groupByClause().groupByAttributeClause();
+      
+      // 遍历处理每个GROUP BY属性
       for (IoTDBSqlParser.GroupByAttributeClauseContext groupByAttribute : groupByAttributes) {
+        // 解析时间窗口分组（GROUP BY TIME或带有interval参数的分组）
         if (groupByAttribute.TIME() != null || groupByAttribute.interval != null) {
           if (groupByKeys.contains("COMMON")) {
             throw new SemanticException(GROUP_BY_COMMON_ONLY_ONE_MSG);
@@ -1381,21 +1392,27 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
 
           groupByKeys.add("COMMON");
           queryStatement.setGroupByTimeComponent(parseGroupByTimeClause(groupByAttribute));
-        } else if (groupByAttribute.LEVEL() != null) {
+        } 
+        // 解析层级分组（GROUP BY LEVEL）
+        else if (groupByAttribute.LEVEL() != null) {
           if (groupByKeys.contains("LEVEL")) {
             throw new SemanticException("duplicated group by key: LEVEL");
           }
 
           groupByKeys.add("LEVEL");
           queryStatement.setGroupByLevelComponent(parseGroupByLevelClause(groupByAttribute));
-        } else if (groupByAttribute.TAGS() != null) {
+        } 
+        // 解析标签分组（GROUP BY TAGS）
+        else if (groupByAttribute.TAGS() != null) {
           if (groupByKeys.contains("TAGS")) {
             throw new SemanticException("duplicated group by key: TAGS");
           }
 
           groupByKeys.add("TAGS");
           queryStatement.setGroupByTagComponent(parseGroupByTagClause(groupByAttribute));
-        } else if (groupByAttribute.VARIATION() != null) {
+        } 
+        // 解析变异窗口分组（GROUP BY VARIATION）
+        else if (groupByAttribute.VARIATION() != null) {
           if (groupByKeys.contains("COMMON")) {
             throw new SemanticException(GROUP_BY_COMMON_ONLY_ONE_MSG);
           }
@@ -1403,7 +1420,9 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
           groupByKeys.add("COMMON");
           queryStatement.setGroupByComponent(
               parseGroupByClause(groupByAttribute, WindowType.VARIATION_WINDOW));
-        } else if (groupByAttribute.CONDITION() != null) {
+        } 
+        // 解析条件窗口分组（GROUP BY CONDITION）
+        else if (groupByAttribute.CONDITION() != null) {
           if (groupByKeys.contains("COMMON")) {
             throw new SemanticException(GROUP_BY_COMMON_ONLY_ONE_MSG);
           }
@@ -1411,7 +1430,9 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
           groupByKeys.add("COMMON");
           queryStatement.setGroupByComponent(
               parseGroupByClause(groupByAttribute, WindowType.CONDITION_WINDOW));
-        } else if (groupByAttribute.SESSION() != null) {
+        } 
+        // 解析会话窗口分组（GROUP BY SESSION）
+        else if (groupByAttribute.SESSION() != null) {
           if (groupByKeys.contains("COMMON")) {
             throw new SemanticException(GROUP_BY_COMMON_ONLY_ONE_MSG);
           }
@@ -1419,7 +1440,9 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
           groupByKeys.add("COMMON");
           queryStatement.setGroupByComponent(
               parseGroupByClause(groupByAttribute, WindowType.SESSION_WINDOW));
-        } else if (groupByAttribute.COUNT() != null) {
+        } 
+        // 解析计数窗口分组（GROUP BY COUNT）
+        else if (groupByAttribute.COUNT() != null) {
           if (groupByKeys.contains("COMMON")) {
             throw new SemanticException(GROUP_BY_COMMON_ONLY_ONE_MSG);
           }
@@ -1428,18 +1451,20 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
           queryStatement.setGroupByComponent(
               parseGroupByClause(groupByAttribute, WindowType.COUNT_WINDOW));
 
-        } else {
+        } 
+        // 未知的GROUP BY类型
+        else {
           throw new SemanticException("Unknown GROUP BY type.");
         }
       }
     }
 
-    // parse HAVING
+    // 解析HAVING子句（如果存在）
     if (ctx.havingClause() != null) {
       queryStatement.setHavingCondition(parseHavingClause(ctx.havingClause()));
     }
 
-    // parse ORDER BY
+    // 解析ORDER BY子句（如果存在）
     if (ctx.orderByClause() != null) {
       queryStatement.setOrderByComponent(
           parseOrderByClause(
@@ -1447,18 +1472,19 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
               ImmutableSet.of(OrderByKey.TIME, OrderByKey.DEVICE, OrderByKey.TIMESERIES)));
     }
 
-    // parse FILL
+    // 解析FILL子句（如果存在）
     if (ctx.fillClause() != null) {
       queryStatement.setFillComponent(parseFillClause(ctx.fillClause()));
     }
 
-    // parse ALIGN BY
+    // 解析ALIGN BY子句（如果存在）
     if (ctx.alignByClause() != null) {
       queryStatement.setResultSetFormat(parseAlignBy(ctx.alignByClause()));
     }
 
+    // 解析分页子句（如果存在）
     if (ctx.paginationClause() != null) {
-      // parse SLIMIT & SOFFSET
+      // 解析SERIES级别的分页（SLIMIT & SOFFSET）
       if (ctx.paginationClause().seriesPaginationClause() != null) {
         if (ctx.paginationClause().seriesPaginationClause().slimitClause() != null) {
           queryStatement.setSeriesLimit(
@@ -1470,7 +1496,7 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
         }
       }
 
-      // parse LIMIT & OFFSET
+      // 解析ROW级别的分页（LIMIT & OFFSET）
       if (ctx.paginationClause().rowPaginationClause() != null) {
         if (ctx.paginationClause().rowPaginationClause().limitClause() != null) {
           queryStatement.setRowLimit(
@@ -1480,36 +1506,49 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
           queryStatement.setRowOffset(
               parseOffsetClause(ctx.paginationClause().rowPaginationClause().offsetClause()));
         }
+        // 如果可能，将LIMIT & OFFSET下推到GROUP BY TIME参数中
         if (canPushDownLimitOffsetToGroupByTime(queryStatement)) {
           pushDownLimitOffsetToTimeParameter(queryStatement);
         }
       }
     }
 
+    // 设置是否使用通配符
     queryStatement.setUseWildcard(useWildcard);
     queryStatement.setLastLevelUseWildcard(lastLevelUseWildcard);
+    
+    // 返回解析完成的查询语句对象
     return queryStatement;
   }
 
   // ---- Select Clause
+  /**
+   * 解析SELECT子句
+   * @param ctx SELECT子句的解析树上下文
+   * @param queryStatement 查询语句对象，用于设置输出属性
+   * @return 解析后的SELECT子句组件
+   */
   private SelectComponent parseSelectClause(
       IoTDBSqlParser.SelectClauseContext ctx, QueryStatement queryStatement) {
+    // 创建SELECT组件对象，用于存储解析结果
     SelectComponent selectComponent = new SelectComponent();
 
-    // parse LAST
+    // 解析LAST关键字
     if (ctx.LAST() != null) {
       selectComponent.setHasLast(true);
     }
 
-    // parse resultColumn
+    // 解析结果列
     Map<String, Expression> aliasToColumnMap = new HashMap<>();
     for (IoTDBSqlParser.ResultColumnContext resultColumnContext : ctx.resultColumn()) {
+      // 解析单个结果列
       ResultColumn resultColumn = parseResultColumn(resultColumnContext);
-      // __endTime shouldn't be included in resultColumns
+      // __endTime不应包含在结果列中，单独处理
       if (resultColumn.getExpression().getExpressionString().equals(ColumnHeaderConstant.ENDTIME)) {
         queryStatement.setOutputEndTime(true);
         continue;
       }
+      // 处理别名映射
       if (resultColumn.hasAlias()) {
         String alias = resultColumn.getAlias();
         if (aliasToColumnMap.containsKey(alias)) {
@@ -1517,50 +1556,87 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
         }
         aliasToColumnMap.put(alias, resultColumn.getExpression());
       }
+      // 添加结果列到SELECT组件
       selectComponent.addResultColumn(resultColumn);
     }
+    // 设置别名到列的映射
     selectComponent.setAliasToColumnMap(aliasToColumnMap);
 
     return selectComponent;
   }
 
+  /**
+   * 解析结果列
+   * @param resultColumnContext 结果列的解析树上下文
+   * @return 解析后的结果列对象
+   */
   private ResultColumn parseResultColumn(IoTDBSqlParser.ResultColumnContext resultColumnContext) {
+    // 解析表达式
     Expression expression = parseExpression(resultColumnContext.expression(), false);
+    // 检查是否为常量表达式，常量不允许作为结果列
     if (expression.isConstantOperand()) {
       throw new SemanticException("Constant operand is not allowed: " + expression);
     }
+    // 解析别名
     String alias = null;
     if (resultColumnContext.AS() != null) {
       alias = parseAlias(resultColumnContext.alias());
     }
+    // 识别结果列类型
     ResultColumn.ColumnType columnType =
         ExpressionAnalyzer.identifyOutputColumnType(expression, true);
+    // 创建并返回结果列对象
     return new ResultColumn(expression, alias, columnType);
   }
 
   // ---- From Clause
+  /**
+   * 解析FROM子句
+   * @param ctx FROM子句的解析树上下文
+   * @return 解析后的FROM子句组件
+   */
   private FromComponent parseFromClause(IoTDBSqlParser.FromClauseContext ctx) {
+    // 创建FROM组件对象，用于存储解析结果
     FromComponent fromComponent = new FromComponent();
+    // 获取所有前缀路径
     List<IoTDBSqlParser.PrefixPathContext> prefixFromPaths = ctx.prefixPath();
+    // 遍历解析每个前缀路径
     for (IoTDBSqlParser.PrefixPathContext prefixFromPath : prefixFromPaths) {
+      // 解析前缀路径
       PartialPath path = parsePrefixPath(prefixFromPath);
+      // 添加路径到FROM组件
       fromComponent.addPrefixPath(path);
     }
     return fromComponent;
   }
 
   // ---- Into Clause
+  /**
+   * 解析INTO子句
+   * @param ctx INTO子句的解析树上下文
+   * @return 解析后的INTO子句组件
+   */
   private IntoComponent parseIntoClause(IoTDBSqlParser.IntoClauseContext ctx) {
+    // 创建INTO项目列表
     List<IntoItem> intoItems = new ArrayList<>();
+    // 遍历解析每个INTO项目
     for (IoTDBSqlParser.IntoItemContext intoItemContext : ctx.intoItem()) {
       intoItems.add(parseIntoItem(intoItemContext));
     }
     return new IntoComponent(intoItems);
   }
 
+  /**
+   * 解析INTO子句中的单个项目
+   * @param intoItemContext INTO项目的解析树上下文
+   * @return 解析后的INTO项目对象
+   */
   private IntoItem parseIntoItem(IoTDBSqlParser.IntoItemContext intoItemContext) {
+    // 检查是否为对齐序列
     boolean isAligned = intoItemContext.ALIGNED() != null;
+    // 解析设备路径
     PartialPath intoDevice = parseIntoPath(intoItemContext.intoPath());
+    // 解析测量值列表
     List<String> intoMeasurements =
         intoItemContext.nodeNameInIntoPath().stream()
             .map(this::parseNodeNameInIntoPath)
@@ -1568,10 +1644,17 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
     return new IntoItem(intoDevice, intoMeasurements, isAligned);
   }
 
+  /**
+   * 解析INTO子句中的路径
+   * @param intoPathContext INTO路径的解析树上下文
+   * @return 解析后的路径对象
+   */
   private PartialPath parseIntoPath(IoTDBSqlParser.IntoPathContext intoPathContext) {
+    // 处理完整路径
     if (intoPathContext instanceof IoTDBSqlParser.FullPathInIntoPathContext) {
       return parseFullPathInIntoPath((IoTDBSqlParser.FullPathInIntoPathContext) intoPathContext);
     } else {
+      // 处理后缀路径
       List<IoTDBSqlParser.NodeNameInIntoPathContext> nodeNames =
           ((IoTDBSqlParser.SuffixPathInIntoPathContext) intoPathContext).nodeNameInIntoPath();
       String[] path = new String[nodeNames.size()];
@@ -1583,7 +1666,13 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
   }
 
   // ---- Where Clause
+  /**
+   * 解析WHERE子句
+   * @param ctx WHERE子句的解析树上下文
+   * @return 解析后的WHERE条件对象
+   */
   private WhereCondition parseWhereClause(IoTDBSqlParser.WhereClauseContext ctx) {
+    // 解析条件表达式
     Expression predicate = parseExpression(ctx.expression(), true);
     return new WhereCondition(predicate);
   }
@@ -2781,126 +2870,177 @@ public class ASTVisitor extends IoTDBSqlParserBaseVisitor<Statement> {
 
   // Expression & Predicate ========================================================================
 
+  /**
+   * 解析表达式，将ANTLR语法树节点转换为IoTDB的表达式对象
+   * 这是一个递归解析器，支持各种类型的表达式解析
+   * 
+   * @param context ANTLR解析上下文，包含表达式的语法树结构
+   * @param canUseFullPath 是否可以使用完整路径（用于时间序列路径解析）
+   * @return 解析后的表达式对象
+   */
   private Expression parseExpression(
       IoTDBSqlParser.ExpressionContext context, boolean canUseFullPath) {
+    // 1. 处理括号表达式：递归解析括号内的表达式
+    // 例如：WHERE (temperature > 25) 会先解析括号内的表达式
     if (context.unaryInBracket != null) {
       return parseExpression(context.unaryInBracket, canUseFullPath);
     }
 
+    // 2. 处理一元运算符表达式
+    // 例如：WHERE NOT temperature > 25 或 WHERE -temperature
     if (context.expressionAfterUnaryOperator != null) {
+      // 处理负号运算符：-expression
       if (context.MINUS() != null) {
         return new NegationExpression(
             parseExpression(context.expressionAfterUnaryOperator, canUseFullPath));
       }
+      // 处理逻辑非运算符：NOT expression
       if (context.operator_not() != null) {
         return new LogicNotExpression(
             parseExpression(context.expressionAfterUnaryOperator, canUseFullPath));
       }
+      // 如果没有特定的一元运算符，直接递归解析子表达式
       return parseExpression(context.expressionAfterUnaryOperator, canUseFullPath);
     }
 
+    // 3. 处理二元运算符表达式（这是最复杂的部分）
+    // 例如：WHERE temperature > 25 AND humidity < 80
     if (context.leftExpression != null && context.rightExpression != null) {
+      // 递归解析左右两个子表达式
       Expression leftExpression = parseExpression(context.leftExpression, canUseFullPath);
       Expression rightExpression = parseExpression(context.rightExpression, canUseFullPath);
+      
+      // 根据具体的运算符类型创建对应的表达式对象
+      
+      // 算术运算符
       if (context.STAR() != null) {
-        return new MultiplicationExpression(leftExpression, rightExpression);
+        return new MultiplicationExpression(leftExpression, rightExpression); // 乘法运算：*
       }
       if (context.DIV() != null) {
-        return new DivisionExpression(leftExpression, rightExpression);
+        return new DivisionExpression(leftExpression, rightExpression); // 除法运算：/
       }
       if (context.MOD() != null) {
-        return new ModuloExpression(leftExpression, rightExpression);
+        return new ModuloExpression(leftExpression, rightExpression); // 取模运算：%
       }
       if (context.PLUS() != null) {
-        return new AdditionExpression(leftExpression, rightExpression);
+        return new AdditionExpression(leftExpression, rightExpression); // 加法运算：+
       }
       if (context.MINUS() != null) {
-        return new SubtractionExpression(leftExpression, rightExpression);
+        return new SubtractionExpression(leftExpression, rightExpression); // 减法运算：-
       }
+      
+      // 比较运算符
       if (context.OPERATOR_GT() != null) {
-        return new GreaterThanExpression(leftExpression, rightExpression);
+        return new GreaterThanExpression(leftExpression, rightExpression); // 大于比较：>
       }
       if (context.OPERATOR_GTE() != null) {
-        return new GreaterEqualExpression(leftExpression, rightExpression);
+        return new GreaterEqualExpression(leftExpression, rightExpression); // 大于等于比较：>=
       }
       if (context.OPERATOR_LT() != null) {
-        return new LessThanExpression(leftExpression, rightExpression);
+        return new LessThanExpression(leftExpression, rightExpression); // 小于比较：<
       }
       if (context.OPERATOR_LTE() != null) {
-        return new LessEqualExpression(leftExpression, rightExpression);
+        return new LessEqualExpression(leftExpression, rightExpression); // 小于等于比较：<=
       }
       if (context.OPERATOR_DEQ() != null || context.OPERATOR_SEQ() != null) {
-        return new EqualToExpression(leftExpression, rightExpression);
+        return new EqualToExpression(leftExpression, rightExpression); // 等于比较：= 或 ==
       }
       if (context.OPERATOR_NEQ() != null) {
-        return new NonEqualExpression(leftExpression, rightExpression);
+        return new NonEqualExpression(leftExpression, rightExpression); // 不等于比较：!=
       }
+      
+      // 逻辑运算符
       if (context.operator_and() != null) {
-        return new LogicAndExpression(leftExpression, rightExpression);
+        return new LogicAndExpression(leftExpression, rightExpression); // 逻辑与运算：AND
       }
       if (context.operator_or() != null) {
-        return new LogicOrExpression(leftExpression, rightExpression);
+        return new LogicOrExpression(leftExpression, rightExpression); // 逻辑或运算：OR
       }
+      
+      // 如果遇到不支持的运算符，抛出异常
       throw new UnsupportedOperationException();
     }
 
+    // 4. 处理正则表达式和LIKE表达式
+    // 例如：WHERE name REGEXP '^test.*' 或 WHERE name LIKE 'test%'
     if (context.unaryBeforeRegularOrLikeExpression != null) {
       if (context.REGEXP() != null) {
-        return parseRegularExpression(context, canUseFullPath);
+        return parseRegularExpression(context, canUseFullPath); // 正则表达式匹配
       }
       if (context.LIKE() != null) {
-        return parseLikeExpression(context, canUseFullPath);
+        return parseLikeExpression(context, canUseFullPath); // LIKE模式匹配
       }
       throw new UnsupportedOperationException();
     }
 
+    // 5. 处理IS NULL表达式
+    // 例如：WHERE temperature IS NULL 或 WHERE temperature IS NOT NULL
     if (context.unaryBeforeIsNullExpression != null) {
-      return parseIsNullExpression(context, canUseFullPath);
+      return parseIsNullExpression(context, canUseFullPath); // IS NULL或IS NOT NULL判断
     }
 
+    // 6. 处理BETWEEN表达式（三操作数表达式）
+    // 例如：WHERE temperature BETWEEN 20 AND 30
     if (context.firstExpression != null
         && context.secondExpression != null
         && context.thirdExpression != null) {
+      // 递归解析三个子表达式：值、下限、上限
       Expression firstExpression = parseExpression(context.firstExpression, canUseFullPath);
       Expression secondExpression = parseExpression(context.secondExpression, canUseFullPath);
       Expression thirdExpression = parseExpression(context.thirdExpression, canUseFullPath);
 
       if (context.operator_between() != null) {
+        // 创建BETWEEN表达式，支持NOT BETWEEN
         return new BetweenExpression(
             firstExpression, secondExpression, thirdExpression, context.operator_not() != null);
       }
       throw new UnsupportedOperationException();
     }
 
+    // 7. 处理IN表达式
+    // 例如：WHERE status IN ('normal', 'warning', 'error')
     if (context.unaryBeforeInExpression != null) {
-      return parseInExpression(context, canUseFullPath);
+      return parseInExpression(context, canUseFullPath); // IN或NOT IN判断
     }
 
+    // 8. 处理标量函数表达式
+    // 例如：WHERE CAST(temperature AS INT) > 25
     if (context.scalarFunctionExpression() != null) {
       return parseScalarFunctionExpression(context.scalarFunctionExpression(), canUseFullPath);
     }
 
+    // 9. 处理普通函数表达式
+    // 例如：WHERE avg(temperature) > 30
     if (context.functionName() != null) {
-      return parseFunctionExpression(context, canUseFullPath);
+      return parseFunctionExpression(context, canUseFullPath); // 内置函数或UDF函数
     }
 
+    // 10. 处理时间序列路径表达式
+    // 例如：WHERE root.sg.d1.s1 > 25
     if (context.fullPathInExpression() != null) {
       return new TimeSeriesOperand(
-          parseFullPathInExpression(context.fullPathInExpression(), canUseFullPath));
+          parseFullPathInExpression(context.fullPathInExpression(), canUseFullPath)); // 时间序列操作数
     }
 
+    // 11. 处理时间戳操作数
+    // 例如：WHERE time > 1234567890
     if (context.time != null) {
-      return new TimestampOperand();
+      return new TimestampOperand(); // 时间戳操作数
     }
 
+    // 12. 处理常量操作数
+    // 例如：WHERE temperature > 25 中的25
     if (context.constant() != null && !context.constant().isEmpty()) {
-      return parseConstantOperand(context.constant(0));
+      return parseConstantOperand(context.constant(0)); // 解析常量值（数字、字符串、布尔值等）
     }
 
+    // 13. 处理CASE WHEN THEN表达式
+    // 例如：WHERE CASE WHEN temperature > 30 THEN 'hot' WHEN temperature < 10 THEN 'cold' ELSE 'normal' END = 'hot'
     if (context.caseWhenThenExpression() != null) {
-      return parseCaseWhenThenExpression(context.caseWhenThenExpression(), canUseFullPath);
+      return parseCaseWhenThenExpression(context.caseWhenThenExpression(), canUseFullPath); // 条件表达式
     }
 
+    // 如果所有条件都不匹配，说明遇到了不支持的表达式类型
     throw new UnsupportedOperationException();
   }
 

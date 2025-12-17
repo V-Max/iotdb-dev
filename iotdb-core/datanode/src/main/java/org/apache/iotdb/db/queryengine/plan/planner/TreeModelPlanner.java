@@ -107,41 +107,60 @@ public class TreeModelPlanner implements IPlanner {
   }
 
   @Override
+  /**
+   * 实现IPlanner接口的doSchedule方法，用于创建并启动查询调度器
+   * 根据不同的语句类型选择合适的调度器实现
+   *
+   * @param analysis 查询分析结果，包含查询的元数据和执行信息
+   * @param distributedPlan 分布式查询计划，包含查询的执行片段和实例信息
+   * @param context MPP查询上下文，包含查询ID、执行参数等
+   * @param stateMachine 查询状态机，用于管理查询的执行状态
+   * @return 已启动的查询调度器实例
+   */
   public IScheduler doSchedule(
       IAnalysis analysis,
       DistributedQueryPlan distributedPlan,
       MPPQueryContext context,
       QueryStateMachine stateMachine) {
+    // 声明查询调度器变量
     IScheduler scheduler;
 
-    boolean isPipeEnrichedTsFileLoad =
+    // 检查是否是管道增强的LoadTsFile语句
+    // PipeEnrichedStatement是一种包装语句，用于支持管道功能
+    boolean isPipeEnrichedTsFileLoad = 
         statement instanceof PipeEnrichedStatement
             && ((PipeEnrichedStatement) statement).getInnerStatement()
                 instanceof LoadTsFileStatement;
+    
+    // 判断语句类型，选择合适的调度器
     if (statement instanceof LoadTsFileStatement || isPipeEnrichedTsFileLoad) {
-      scheduler =
+      // 如果是LoadTsFile语句或管道增强的LoadTsFile语句，使用LoadTsFileScheduler
+      scheduler = 
           new LoadTsFileScheduler(
-              distributedPlan,
-              context,
-              stateMachine,
-              syncInternalServiceClientManager,
-              partitionFetcher,
-              isPipeEnrichedTsFileLoad);
+              distributedPlan, // 分布式查询计划
+              context, // 查询上下文
+              stateMachine, // 查询状态机
+              syncInternalServiceClientManager, // 同步内部服务客户端管理器
+              partitionFetcher, // 分区获取器
+              isPipeEnrichedTsFileLoad); // 是否是管道增强的LoadTsFile语句
     } else {
-      scheduler =
+      // 否则使用通用的ClusterScheduler
+      scheduler = 
           new ClusterScheduler(
-              context,
-              stateMachine,
-              distributedPlan.getInstances(),
-              context.getQueryType(),
-              executor,
-              writeOperationExecutor,
-              scheduledExecutor,
-              syncInternalServiceClientManager,
-              asyncInternalServiceClientManager);
+              context, // 查询上下文
+              stateMachine, // 查询状态机
+              distributedPlan.getInstances(), // 查询计划实例列表
+              context.getQueryType(), // 查询类型（读/写）
+              executor, // 通用执行器
+              writeOperationExecutor, // 写操作执行器
+              scheduledExecutor, // 定时执行器
+              syncInternalServiceClientManager, // 同步内部服务客户端管理器
+              asyncInternalServiceClientManager); // 异步内部服务客户端管理器
     }
 
+    // 启动调度器
     scheduler.start();
+    // 返回已启动的调度器实例
     return scheduler;
   }
 

@@ -543,47 +543,74 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
     }
   }
 
+  /**
+   * 分析查询语句的模式信息，构建模式树（ISchemaTree）
+   * 该方法在查询分析过程中负责获取和构建查询涉及的所有时间序列的模式信息
+   * 
+   * @param queryStatement 查询语句对象，包含SELECT、FROM、WHERE等子句信息
+   * @param analysis 分析结果对象，用于存储分析过程中的中间结果
+   * @param context 多进程并行查询上下文，包含查询执行环境信息
+   * @return ISchemaTree 构建的模式树，包含查询涉及的所有时间序列的模式信息
+   */
   private ISchemaTree analyzeSchema(
       QueryStatement queryStatement, Analysis analysis, MPPQueryContext context) {
-    // concat path and construct path pattern tree
+    // 步骤1：路径拼接和模式树构建 - 使用ConcatPathRewriter重写查询语句中的路径
+    // 创建路径重写器，用于处理路径拼接和通配符扩展
     ConcatPathRewriter concatPathRewriter = new ConcatPathRewriter();
+    // 重写查询语句，将路径模式转换为完整的路径模式树
     queryStatement =
         (QueryStatement)
             concatPathRewriter.rewrite(
                 queryStatement, new PathPatternTree(queryStatement.useWildcard()), context);
+    // 将重写后的查询语句设置到分析结果中
     analysis.setStatement(queryStatement);
 
-    // request schema fetch API
+    // 步骤2：请求模式获取API - 记录模式获取开始时间
     long startTime = System.nanoTime();
     ISchemaTree schemaTree;
     try {
+      // 记录模式获取开始日志
       logger.debug("[StartFetchSchema]");
-      PathPatternTree authorizedPatternTree = queryStatement.getAuthorityScope();
-      // If the authority scope of query statement contains full path, we should fetch schema
-      // without template. Otherwise, the result ISchemaTree may contain template series that is
-      // not authorized to access.
+      
+      // 步骤3：获取授权路径模式树，用于权限检查
+PathPatternTree authorizedPatternTree = queryStatement.getAuthorityScope();
+      
+      // 步骤4：确定是否所有叶子节点都是通配符
+      // 如果授权范围不包含完整路径且包含通配符，则所有叶子节点都是通配符
+      // 这种情况需要特殊处理，避免获取未授权的模板序列
       boolean allWildcardLeaf =
           !authorizedPatternTree.isContainFullPath() && authorizedPatternTree.isContainWildcard();
+      
+      // 步骤5：根据查询类型选择不同的模式获取方式
       if (queryStatement.isGroupByTag()) {
+        // 如果是按标签分组查询，使用带标签的模式获取方法
         schemaTree =
             schemaFetcher.fetchSchemaWithTags(
                 concatPathRewriter.getPatternTree(), allWildcardLeaf, context);
       } else {
+        // 普通查询，使用标准模式获取方法
         schemaTree =
             schemaFetcher.fetchSchema(
                 concatPathRewriter.getPatternTree(), allWildcardLeaf, context);
       }
 
-      // make sure paths in logical view is fetched
+      // 步骤6：确保逻辑视图中的路径也被获取到
+      // 如果模式树中包含逻辑视图，需要更新模式树以包含视图的源路径
       updateSchemaTreeByViews(analysis, schemaTree, context);
     } finally {
+      // 步骤7：记录模式获取结束时间和性能指标
       logger.debug("[EndFetchSchema]");
+      // 计算模式获取耗时
       long schemaFetchCost = System.nanoTime() - startTime;
+      // 将耗时设置到查询上下文中
       context.setFetchSchemaCost(schemaFetchCost);
+      // 记录查询计划成本指标
       QueryPlanCostMetricSet.getInstance().recordPlanCost(SCHEMA_FETCHER, schemaFetchCost);
     }
 
+    // 步骤8：将构建的模式树设置到分析结果中
     analysis.setSchemaTree(schemaTree);
+    // 返回构建的模式树
     return schemaTree;
   }
 
@@ -647,7 +674,6 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
 
       // 对原始谓词表达式进行简化处理
       predicate = PredicateUtils.simplifyPredicate(predicate);
-
       // 如果不存在值过滤器或者简化后的谓词是恒真表达式，则将WHERE条件设置为null
       // 这意味着查询不需要额外的值过滤，可以仅依赖时间过滤
       if (!hasValueFilter || predicate.equals(ConstantOperand.TRUE)) {
@@ -827,33 +853,45 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
 
   /** process select component for align by time. */
   private List<Pair<Expression, String>> analyzeSelect(
-      Analysis analysis,
-      QueryStatement queryStatement,
-      ISchemaTree schemaTree,
-      MPPQueryContext queryContext) {
+      Analysis analysis,                    // 存储分析结果的核心对象
+      QueryStatement queryStatement,        // 查询语句对象
+      ISchemaTree schemaTree,               // 模式树，包含数据模式信息
+      MPPQueryContext queryContext) {       // 查询上下文，包含查询执行环境信息
+  
+    // 创建输出表达式映射，按列索引组织输出表达式
     Map<Integer, List<Pair<Expression, String>>> outputExpressionMap = new HashMap<>();
-
+  
+    // 创建分页控制器，用于处理SLIMIT和SOFFSET限制
     ColumnPaginationController paginationController =
         new ColumnPaginationController(
             queryStatement.getSeriesLimit(), queryStatement.getSeriesOffset());
-
+  
+    // 用于检查别名唯一性的集合
     Set<String> aliasSet = new HashSet<>();
-
+  
     int columnIndex = 0;
-
+  
+    // 遍历查询语句中的所有结果列
     for (ResultColumn resultColumn : queryStatement.getSelectComponent().getResultColumns()) {
       List<Pair<Expression, String>> outputExpressions = new ArrayList<>();
+      // 绑定模式信息到表达式，解析通配符和路径模式
       List<Expression> resultExpressions =
           bindSchemaForExpression(resultColumn.getExpression(), schemaTree, queryContext);
-
+  
+      // 处理每个解析后的表达式
       for (Expression resultExpression : resultExpressions) {
         if (paginationController.hasCurOffset()) {
+          // 如果有偏移量需要跳过，消耗偏移量
           paginationController.consumeOffset();
         } else if (paginationController.hasCurLimit()) {
+          // 检查别名唯一性，确保没有重复别名
           checkAliasUniqueness(resultColumn.getAlias(), aliasSet);
-
+  
+          // 规范化表达式，统一表达式格式
           Expression normalizedExpression = normalizeExpression(resultExpression);
+          // 分析表达式类型，确定数据类型
           analyzeExpressionType(analysis, normalizedExpression);
+          // 创建输出表达式对（表达式，别名）
           outputExpressions.add(
               new Pair<>(
                   normalizedExpression,
@@ -862,16 +900,19 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
                       resultExpression,
                       normalizedExpression,
                       queryStatement)));
+          // 消耗限制计数
           paginationController.consumeLimit();
         } else {
+          // 达到限制数量，跳出循环
           break;
         }
       }
-
+  
+      // 将当前列的输出表达式添加到映射中
       outputExpressionMap.put(columnIndex++, outputExpressions);
     }
-
-    // construct output expressions
+  
+    // 构造最终输出表达式列表
     List<Pair<Expression, String>> outputExpressions = new ArrayList<>();
     outputExpressionMap.values().forEach(outputExpressions::addAll);
     return outputExpressions;
@@ -895,107 +936,129 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
         : deviceSet.stream().sorted(Comparator.reverseOrder()).collect(Collectors.toList());
   }
 
+  /**
+   * 处理ALIGN BY DEVICE查询，将SELECT表达式与具体设备路径绑定
+   * 通过schemaTree将查询表达式与实际的测量值元数据进行绑定
+   */
   /** process select component for align by device. */
   private List<Pair<Expression, String>> analyzeSelect(
-      Analysis analysis,
-      QueryStatement queryStatement,
-      ISchemaTree schemaTree,
-      List<PartialPath> deviceList,
-      MPPQueryContext queryContext) {
-    List<Pair<Expression, String>> outputExpressions = new ArrayList<>();
-    Map<String, Set<Expression>> deviceToSelectExpressions = new HashMap<>();
-    ColumnPaginationController paginationController =
-        new ColumnPaginationController(
-            queryStatement.getSeriesLimit(), queryStatement.getSeriesOffset());
-
-    for (ResultColumn resultColumn : queryStatement.getSelectComponent().getResultColumns()) {
-      Expression selectExpression = resultColumn.getExpression();
-
-      // select expression after removing wildcard
-      // use LinkedHashMap for order-preserving
-      Map<Expression, Map<String, Expression>> measurementToDeviceSelectExpressions =
-          new LinkedHashMap<>();
+      Analysis analysis,                    // 分析结果容器，存储所有分析信息
+      QueryStatement queryStatement,       // 查询语句对象，包含SELECT、FROM等组件
+      ISchemaTree schemaTree,              // 模式树，提供元数据信息
+      List<PartialPath> deviceList,        // 设备路径列表，FROM子句解析得到的设备集合
+      MPPQueryContext queryContext) {      // 查询上下文，包含查询配置信息
+      
+      // 初始化输出表达式列表，每个元素是表达式和别名的配对
+      List<Pair<Expression, String>> outputExpressions = new ArrayList<>();
+      
+      // 设备到选择表达式的映射，记录每个设备对应的查询表达式
+      Map<String, Set<Expression>> deviceToSelectExpressions = new HashMap<>();
+      
+      // 分页控制器，处理SLIMIT和SOFFSET限制
+      ColumnPaginationController paginationController =
+          new ColumnPaginationController(
+              queryStatement.getSeriesLimit(), queryStatement.getSeriesOffset());
+  
+      // 遍历SELECT子句中的每个结果列
+      for (ResultColumn resultColumn : queryStatement.getSelectComponent().getResultColumns()) {
+          Expression selectExpression = resultColumn.getExpression();
+  
+          // 去除通配符后的选择表达式映射
+          // 使用LinkedHashMap保持顺序
+          Map<Expression, Map<String, Expression>> measurementToDeviceSelectExpressions =
+              new LinkedHashMap<>();
+          
+          // 遍历每个设备路径
+          for (PartialPath device : deviceList) {
+              // 将选择表达式与设备路径连接，并绑定模式信息
+              List<Expression> selectExpressionsOfOneDevice =
+                  concatDeviceAndBindSchemaForExpression(
+                      selectExpression, device, schemaTree, queryContext);
+              if (selectExpressionsOfOneDevice.isEmpty()) {
+                  continue;  // 如果该设备没有匹配的测量值，跳过
+              }
+  
+              // 更新测量值到设备选择表达式的映射
+              updateMeasurementToDeviceSelectExpressions(
+                  analysis, measurementToDeviceSelectExpressions, device, selectExpressionsOfOneDevice);
+          }
+  
+          // 检查别名唯一性
+          checkAliasUniqueness(resultColumn.getAlias(), measurementToDeviceSelectExpressions);
+  
+          // 处理每个测量值对应的设备选择表达式
+          for (Map.Entry<Expression, Map<String, Expression>> entry :
+              measurementToDeviceSelectExpressions.entrySet()) {
+              Expression measurementExpression = entry.getKey();
+              Map<String, Expression> deviceToSelectExpressionsOfOneMeasurement = entry.getValue();
+  
+              // 处理分页偏移量
+              if (paginationController.hasCurOffset()) {
+                  paginationController.consumeOffset();
+              } 
+              // 处理分页限制
+              else if (paginationController.hasCurLimit()) {
+                  // 分析每个设备上该测量值表达式的数据类型
+                  deviceToSelectExpressionsOfOneMeasurement
+                      .values()
+                      .forEach(expression -> analyzeExpressionType(analysis, expression));
+                  
+                  // 检查相同测量值名称但不同设备的路径数据类型是否一致
+                  checkDataTypeConsistencyInAlignByDevice(
+                      analysis, new ArrayList<>(deviceToSelectExpressionsOfOneMeasurement.values()));
+  
+                  // 添加输出表达式
+                  Expression lowerCaseMeasurementExpression = toLowerCaseExpression(measurementExpression);
+                  analyzeExpressionType(analysis, lowerCaseMeasurementExpression);
+  
+                  outputExpressions.add(
+                      new Pair<>(
+                          lowerCaseMeasurementExpression,
+                          analyzeAlias(
+                              resultColumn.getAlias(),
+                              measurementExpression,
+                              lowerCaseMeasurementExpression,
+                              queryStatement)));
+  
+                  // 更新设备到选择表达式的映射
+                  updateDeviceToSelectExpressions(
+                      analysis, deviceToSelectExpressions, deviceToSelectExpressionsOfOneMeasurement);
+  
+                  paginationController.consumeLimit();
+              } else {
+                  break;  // 达到分页限制，退出循环
+              }
+          }
+      }
+  
+      // 移除没有测量值需要计算的设备
+      Set<PartialPath> noMeasurementDevices = new HashSet<>();
       for (PartialPath device : deviceList) {
-        List<Expression> selectExpressionsOfOneDevice =
-            concatDeviceAndBindSchemaForExpression(
-                selectExpression, device, schemaTree, queryContext);
-        if (selectExpressionsOfOneDevice.isEmpty()) {
-          continue;
-        }
-
-        updateMeasurementToDeviceSelectExpressions(
-            analysis, measurementToDeviceSelectExpressions, device, selectExpressionsOfOneDevice);
+          if (!deviceToSelectExpressions.containsKey(device.getFullPath())) {
+              noMeasurementDevices.add(device);
+          }
       }
-
-      checkAliasUniqueness(resultColumn.getAlias(), measurementToDeviceSelectExpressions);
-
-      for (Map.Entry<Expression, Map<String, Expression>> entry :
-          measurementToDeviceSelectExpressions.entrySet()) {
-        Expression measurementExpression = entry.getKey();
-        Map<String, Expression> deviceToSelectExpressionsOfOneMeasurement = entry.getValue();
-
-        if (paginationController.hasCurOffset()) {
-          paginationController.consumeOffset();
-        } else if (paginationController.hasCurLimit()) {
-          deviceToSelectExpressionsOfOneMeasurement
-              .values()
-              .forEach(expression -> analyzeExpressionType(analysis, expression));
-          // check whether the datatype of paths which has the same measurement name are
-          // consistent; if not, throw a SemanticException
-          checkDataTypeConsistencyInAlignByDevice(
-              analysis, new ArrayList<>(deviceToSelectExpressionsOfOneMeasurement.values()));
-
-          // add outputExpressions
-          Expression lowerCaseMeasurementExpression = toLowerCaseExpression(measurementExpression);
-          analyzeExpressionType(analysis, lowerCaseMeasurementExpression);
-
-          outputExpressions.add(
-              new Pair<>(
-                  lowerCaseMeasurementExpression,
-                  analyzeAlias(
-                      resultColumn.getAlias(),
-                      measurementExpression,
-                      lowerCaseMeasurementExpression,
-                      queryStatement)));
-
-          // add deviceToSelectExpressions
-          updateDeviceToSelectExpressions(
-              analysis, deviceToSelectExpressions, deviceToSelectExpressionsOfOneMeasurement);
-
-          paginationController.consumeLimit();
-        } else {
-          break;
-        }
+      deviceList.removeAll(noMeasurementDevices);
+  
+      // 当任何设备的选择表达式为空时，也需要从WHERE表达式映射中移除该设备
+      if (analysis.getDeviceToWhereExpression() != null) {
+          noMeasurementDevices.forEach(
+              devicePath -> analysis.getDeviceToWhereExpression().remove(devicePath.getFullPath()));
       }
-    }
-
-    // remove devices without measurements to compute
-    Set<PartialPath> noMeasurementDevices = new HashSet<>();
-    for (PartialPath device : deviceList) {
-      if (!deviceToSelectExpressions.containsKey(device.getFullPath())) {
-        noMeasurementDevices.add(device);
+  
+      // 设置选择表达式集合
+      Set<Expression> selectExpressions = new LinkedHashSet<>();
+      selectExpressions.add(DEVICE_EXPRESSION);  // 添加设备表达式
+      if (queryStatement.isOutputEndTime()) {
+          selectExpressions.add(END_TIME_EXPRESSION);  // 如果需要输出结束时间，添加结束时间表达式
       }
-    }
-    deviceList.removeAll(noMeasurementDevices);
-
-    // when the select expression of any device is empty,
-    // the where expression map also need remove this device
-    if (analysis.getDeviceToWhereExpression() != null) {
-      noMeasurementDevices.forEach(
-          devicePath -> analysis.getDeviceToWhereExpression().remove(devicePath.getFullPath()));
-    }
-
-    Set<Expression> selectExpressions = new LinkedHashSet<>();
-    selectExpressions.add(DEVICE_EXPRESSION);
-    if (queryStatement.isOutputEndTime()) {
-      selectExpressions.add(END_TIME_EXPRESSION);
-    }
-    outputExpressions.forEach(pair -> selectExpressions.add(pair.getLeft()));
-    analysis.setSelectExpressions(selectExpressions);
-
-    analysis.setDeviceToSelectExpressions(deviceToSelectExpressions);
-
-    return outputExpressions;
+      outputExpressions.forEach(pair -> selectExpressions.add(pair.getLeft()));
+      analysis.setSelectExpressions(selectExpressions);
+  
+      // 设置设备到选择表达式的映射
+      analysis.setDeviceToSelectExpressions(deviceToSelectExpressions);
+  
+      return outputExpressions;
   }
 
   private void updateMeasurementToDeviceSelectExpressions(
@@ -1129,7 +1192,6 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
     if (!queryStatement.hasHaving()) {
       return;
     }
-
     // two maps to be updated
     Map<String, Set<Expression>> deviceToAggregationExpressions =
         analysis.getDeviceToAggregationExpressions();
@@ -1201,18 +1263,37 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
     }
   }
 
+  /**
+   * 设置SELECT表达式到Analysis对象中
+   * 该方法负责将分析后的输出表达式收集并存储到Analysis对象的selectExpressions集合中
+   * 执行后，Analysis对象将包含查询的所有输出表达式，为后续查询执行提供基础
+   *
+   * @param analysis 分析结果对象，用于存储查询分析过程中收集的所有信息
+   * @param queryStatement 查询语句对象，包含完整的SQL查询信息
+   * @param outputExpressions 经过分析后的输出表达式列表，包含表达式和别名信息
+   */
   private void setSelectExpressions(
       Analysis analysis,
       QueryStatement queryStatement,
       List<Pair<Expression, String>> outputExpressions) {
+    // 创建有序的表达式集合，保持SELECT子句中表达式的顺序
     Set<Expression> selectExpressions = new LinkedHashSet<>();
+    
+    // 如果查询需要输出结束时间，添加END_TIME_EXPRESSION到选择表达式集合中
+    // 这在聚合查询中特别重要，用于显示聚合结果的时间范围
     if (queryStatement.isOutputEndTime()) {
       selectExpressions.add(END_TIME_EXPRESSION);
     }
+    
+    // 遍历所有输出表达式，将其添加到选择表达式集合中
+    // 这里只使用表达式的左部分（即表达式本身），忽略别名信息
     for (Pair<Expression, String> outputExpressionAndAlias : outputExpressions) {
       Expression outputExpression = outputExpressionAndAlias.left;
       selectExpressions.add(outputExpression);
     }
+    
+    // 将最终的选择表达式集合设置到Analysis对象中
+    // 这个集合将在查询执行阶段用于生成最终的结果集
     analysis.setSelectExpressions(selectExpressions);
   }
 
@@ -1231,7 +1312,6 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
     if (analysis.hasValueFilter()) {
       throw new SemanticException("Only time filters are supported in GROUP BY TAGS query");
     }
-
     List<String> tagKeys = queryStatement.getGroupByTagComponent().getTagKeys();
     Map<List<String>, LinkedHashMap<Expression, List<Expression>>>
         tagValuesToGroupedTimeseriesOperands = new HashMap<>();
@@ -1436,46 +1516,71 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
     }
   }
 
+  /**
+   * 分析源转换表达式
+   * 该方法负责确定哪些表达式需要从原始数据源进行转换处理
+   * 执行后，Analysis对象将包含所有需要源转换的表达式，为数据读取和转换提供指导
+   *
+   * @param analysis 分析结果对象，用于存储查询分析过程中收集的所有信息
+   * @param outputExpressions 输出表达式列表，包含表达式和别名信息
+   * @param queryStatement 查询语句对象，包含完整的SQL查询信息
+   */
   private void analyzeSourceTransform(
       Analysis analysis,
       List<Pair<Expression, String>> outputExpressions,
       QueryStatement queryStatement) {
+    // 获取Analysis对象中的源转换表达式集合，用于存储需要转换的表达式
     Set<Expression> sourceTransformExpressions = analysis.getSourceTransformExpressions();
 
+    // 根据查询类型（聚合查询或普通查询）采用不同的处理策略
     if (queryStatement.isAggregationQuery()) {
+      // 处理聚合查询的源转换表达式
       if (queryStatement.isCountTimeAggregation()) {
+        // 特殊处理count_time聚合函数
+        // count_time函数需要处理其内部的时间序列表达式
 
         for (Pair<Expression, String> pair : outputExpressions) {
           FunctionExpression countTimeExpression = (FunctionExpression) pair.left;
+          // 遍历count_time函数的所有时间序列表达式
           for (Expression countTimeSourceExpression :
               countTimeExpression.getCountTimeExpressions()) {
+            // 分析表达式类型并添加到源转换表达式集合
             analyzeExpressionType(analysis, countTimeSourceExpression);
             sourceTransformExpressions.add(countTimeSourceExpression);
           }
         }
 
-        // count_time only returns one result
+        // count_time聚合只返回一个结果，因此需要清理输出表达式列表
+        // 只保留第一个count_time表达式作为输出
         Pair<Expression, String> firstCountTimeExpression = outputExpressions.get(0);
         outputExpressions.clear();
         outputExpressions.add(firstCountTimeExpression);
 
       } else {
+        // 处理普通聚合查询的源转换表达式
         for (Expression aggExpression : analysis.getAggregationExpressions()) {
-          // for COUNT_IF, only the first Expression of input need to transform
+          // 对于COUNT_IF函数，只需要转换第一个输入表达式
+          // 其他输入表达式保持原样处理
           if (SqlConstant.COUNT_IF.equalsIgnoreCase(
               ((FunctionExpression) aggExpression).getFunctionName())) {
             sourceTransformExpressions.add(aggExpression.getExpressions().get(0));
           } else {
+            // 对于其他聚合函数，转换所有输入表达式
             sourceTransformExpressions.addAll(aggExpression.getExpressions());
           }
         }
       }
 
+      // 如果查询包含GROUP BY子句，将分组表达式也添加到源转换表达式中
       if (queryStatement.hasGroupByExpression()) {
         sourceTransformExpressions.add(analysis.getGroupByExpression());
       }
     } else {
+      // 处理非聚合查询的源转换表达式
+      // 对于普通查询，所有选择表达式都需要进行源转换
       sourceTransformExpressions.addAll(analysis.getSelectExpressions());
+      
+      // 如果查询包含ORDER BY子句，将排序表达式也添加到源转换表达式中
       if (queryStatement.hasOrderByExpression()) {
         sourceTransformExpressions.addAll(analysis.getOrderByExpressions());
       }
@@ -1529,16 +1634,32 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
     analysis.setOutputDeviceToQueriedDevicesMap(outputDeviceToQueriedDevicesMap);
   }
 
+  /**
+   * 分析源表达式
+   * 该方法负责从源转换表达式和WHERE表达式中提取最终的源表达式
+   * 执行后，Analysis对象将包含查询涉及的所有底层数据源表达式，为数据分区和读取提供基础
+   *
+   * @param analysis 分析结果对象，用于存储查询分析过程中收集的所有信息
+   * @param queryStatement 查询语句对象，包含完整的SQL查询信息
+   */
   private void analyzeSource(Analysis analysis, QueryStatement queryStatement) {
+    // 获取Analysis对象中的源表达式集合，用于存储查询涉及的所有底层数据源
     Set<Expression> sourceExpressions = analysis.getSourceExpressions();
+    
+    // 如果源表达式集合为空，则创建新的集合并设置到Analysis对象中
     if (sourceExpressions == null) {
       sourceExpressions = new HashSet<>();
       analysis.setSourceExpressions(sourceExpressions);
     }
 
+    // 从源转换表达式中提取所有源表达式
+    // 源转换表达式可能包含复杂的表达式结构，需要递归提取其中的基础源表达式
     for (Expression expression : analysis.getSourceTransformExpressions()) {
       sourceExpressions.addAll(searchSourceExpressions(expression));
     }
+    
+    // 如果查询包含WHERE子句，从WHERE表达式中提取源表达式
+    // WHERE条件中的表达式也需要访问底层数据源
     Expression whereExpression = analysis.getWhereExpression();
     if (whereExpression != null) {
       sourceExpressions.addAll(searchSourceExpressions(analysis.getWhereExpression()));
@@ -1582,14 +1703,28 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
     analysis.setHasValueFilter(hasValueFilter);
   }
 
+  /**
+   * 分析查询的WHERE子句
+   * 该方法负责解析WHERE条件，绑定模式信息，验证表达式类型，并设置到Analysis对象中
+   * 执行后，Analysis对象将包含有效的WHERE表达式，用于后续的数据过滤处理
+   *
+   * @param analysis 分析结果对象，用于存储查询分析过程中收集的所有信息
+   * @param queryStatement 查询语句对象，包含完整的SQL查询信息
+   * @param schemaTree 模式树对象，包含查询涉及的数据结构信息
+   * @param queryContext 查询上下文，包含查询的全局信息
+   */
   private void analyzeWhere(
       Analysis analysis,
       QueryStatement queryStatement,
       ISchemaTree schemaTree,
       MPPQueryContext queryContext) {
+    // 检查查询是否包含WHERE子句，如果没有则直接返回
     if (!queryStatement.hasWhere()) {
       return;
     }
+    
+    // 使用ExpressionAnalyzer绑定模式信息，将WHERE条件中的谓词与实际的模式信息关联
+    // 这一步确保WHERE条件中的列名能够正确映射到数据库中的实际列
     List<Expression> conJunctions =
         ExpressionAnalyzer.bindSchemaForPredicate(
             queryStatement.getWhereCondition().getPredicate(),
@@ -1597,17 +1732,28 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
             schemaTree,
             true,
             queryContext);
+    
+    // 将连接表达式转换为统一的WHERE表达式格式
+    // 这个过程包括去重、简化和规范化表达式
     Expression whereExpression = convertConJunctionsToWhereExpression(conJunctions);
+    
+    // 如果WHERE表达式恒为真，说明没有有效的过滤条件
+    // 这种情况下设置WHERE表达式为null，并标记没有值过滤器
     if (whereExpression.equals(ConstantOperand.TRUE)) {
       analysis.setWhereExpression(null);
       analysis.setHasValueFilter(false);
       return;
     }
 
+    // 分析WHERE表达式的输出类型，确保其为布尔类型
+    // WHERE条件必须返回布尔值才能用于数据过滤
     TSDataType outputType = analyzeExpressionType(analysis, whereExpression);
     if (outputType != TSDataType.BOOLEAN) {
       throw new SemanticException(String.format(WHERE_WRONG_TYPE_ERROR_MSG, outputType));
     }
+    
+    // 将验证通过的WHERE表达式设置到Analysis对象中
+    // 这个表达式将在查询执行阶段用于过滤数据
     analysis.setWhereExpression(whereExpression);
   }
 
@@ -2240,6 +2386,7 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
   /**
    * 分析查询相关的数据分区信息，为查询执行准备分区元数据
    * 数据分区决定了数据在分布式系统中的存储位置，对查询性能至关重要
+   * 执行后，Analysis对象将包含数据分区信息，为查询计划生成提供物理存储位置信息
    *
    * @param analysis 分析结果对象，用于存储查询分析过程中收集的所有信息
    * @param queryStatement 查询语句对象，包含完整的SQL查询信息
@@ -2253,25 +2400,30 @@ public class AnalyzeVisitor extends StatementVisitor<Analysis, MPPQueryContext> 
           MPPQueryContext context) {      // 查询上下文，维护查询执行的环境信息
 
     // 创建设备集合，用于存储本次查询涉及的所有设备路径
+    // 设备路径是数据分区的基础，每个设备对应一个或多个数据分区
     Set<String> deviceSet = new HashSet<>();
 
     // 根据查询类型确定如何获取设备集合
+    // 不同的查询模式（按设备对齐 vs 普通查询）需要不同的设备获取策略
     if (queryStatement.isAlignByDevice()) {
       // 按设备对齐模式：从输出设备到查询设备的映射中获取所有设备路径
-      // 这种模式下查询是按设备组织结果的
+      // 这种模式下查询是按设备组织结果的，设备信息已经在前面的分析步骤中收集
       deviceSet = new HashSet<>(analysis.getOutputDeviceToQueriedDevicesMap().values());
     } else {
       // 非按设备对齐模式：从源表达式中提取设备名称
       // 遍历所有源表达式，获取每个表达式对应的设备名
+      // 源表达式可能包含多个设备，需要去重处理
       for (Expression expression : analysis.getSourceExpressions()) {
         deviceSet.add(ExpressionAnalyzer.getDeviceNameInSourceExpression(expression));
       }
     }
 
     // 核心操作：根据设备集合获取数据分区信息
+    // 这一步是查询优化的关键，决定了数据读取的物理位置和并行度
     DataPartition dataPartition = fetchDataPartitionByDevices(deviceSet, schemaTree, context);
 
     // 将获取到的数据分区信息设置到分析结果对象中，供后续查询执行使用
+    // 数据分区信息将在查询计划生成阶段用于确定数据读取策略
     analysis.setDataPartitionInfo(dataPartition);
   }
 

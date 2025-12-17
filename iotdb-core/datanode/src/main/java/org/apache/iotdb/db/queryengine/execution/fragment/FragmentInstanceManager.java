@@ -241,17 +241,58 @@ public class FragmentInstanceManager {
         queryId, queryId1 -> new DataNodeQueryContext(dataNodeFINum));
   }
 
+  /**
+   * 执行模式查询片段实例，将查询计划转换为可执行的驱动器和管道
+   * 
+   * 该方法负责将查询计划（PlanNode树）转换为可执行的执行计划，包括：
+   * 1. 创建状态机和执行上下文
+   * 2. 调用LocalExecutionPlanner生成执行计划
+   * 3. 创建驱动器和执行实例
+   * 4. 管理执行生命周期和资源清理
+   * 
+   * 示例查询：SELECT t1 AS ref0 FROM root.db0 WHERE t1 + 2 <= 10
+   * 在这个查询中，该方法负责将查询计划转换为具体的执行组件
+   * 
+   * 表1：execSchemaQueryFragmentInstance方法执行流程
+   * | 步骤 | 功能描述 | 关键数据结构变化 | 示例（SELECT t1 AS ref0 FROM root.db0 WHERE t1 + 2 <= 10） |
+   * |------|---------|-----------------|----------------------------------------------------------|
+   * | 1. 实例标识 | 获取片段实例ID | FragmentInstance → FragmentInstanceId | 实例ID: "FragmentInstance_1" |
+   * | 2. 状态机创建 | 创建执行状态机 | 创建FragmentInstanceStateMachine | 跟踪执行状态（RUNNING、FINISHED等） |
+   * | 3. 上下文创建 | 创建执行上下文 | 创建FragmentInstanceContext | 包含查询参数、内存管理等 |
+   * | 4. 计划生成 | 调用planner.plan生成执行计划 | PlanNode树 → PipelineDriverFactory列表 | 生成SeriesScan→Filter→Project→IdentitySink的管道 |
+   * | 5. 驱动器创建 | 创建执行驱动器 | PipelineDriverFactory → IDriver | 创建具体的执行线程 |
+   * | 6. 执行实例创建 | 创建执行实例 | 组装所有组件为FragmentInstanceExecution | 管理整个查询执行过程 |
+   * | 7. 生命周期管理 | 添加状态监听器 | 监听执行状态变化 | 执行完成后自动清理资源 |
+   * 
+   * 表2：查询执行过程中的关键组件
+   * | 组件 | 类型 | 功能描述 | 在示例查询中的作用 |
+   * |------|------|---------|-------------------|
+   * | FragmentInstance | 片段实例 | 查询执行的基本单位 | 包含SELECT t1 AS ref0查询的完整执行计划 |
+   * | FragmentInstanceStateMachine | 状态机 | 管理执行状态 | 跟踪查询执行进度（开始、运行、完成） |
+   * | PipelineDriverFactory | 管道工厂 | 生成执行管道 | 创建数据扫描→过滤→投影的执行流水线 |
+   * | IDriver | 驱动器 | 执行具体操作 | 执行SeriesScanOperator、FilterOperator等 |
+   * | ISink | 接收器 | 数据输出接口 | IdentitySinkOperator负责最终结果输出 |
+   * 
+   * @param instance 片段实例，包含查询计划和执行参数
+   * @param schemaRegion 模式区域，用于模式查询
+   * @return FragmentInstanceInfo 包含执行状态和结果信息
+   */
   @SuppressWarnings("squid:S1181")
   public FragmentInstanceInfo execSchemaQueryFragmentInstance(
       FragmentInstance instance, ISchemaRegion schemaRegion) {
+    // 步骤1：获取片段实例的唯一标识符
     FragmentInstanceId instanceId = instance.getId();
+    
+    // 步骤2：创建或获取片段实例执行对象，使用computeIfAbsent确保线程安全
     FragmentInstanceExecution execution =
         instanceExecution.computeIfAbsent(
             instanceId,
             id -> {
+              // 步骤2.1：创建状态机，用于跟踪和管理执行状态
               FragmentInstanceStateMachine stateMachine =
                   new FragmentInstanceStateMachine(instanceId, instanceNotificationExecutor);
 
+              // 步骤2.2：创建执行上下文，包含查询执行所需的所有环境信息
               FragmentInstanceContext context =
                   instanceContext.computeIfAbsent(
                       instanceId,
@@ -260,15 +301,20 @@ public class FragmentInstanceManager {
                               fragmentInstanceId, stateMachine, instance.getSessionInfo()));
 
               try {
+                // 步骤3：调用LocalExecutionPlanner生成执行计划
+                // 关键：将PlanNode树转换为PipelineDriverFactory列表
                 List<PipelineDriverFactory> driverFactories =
                     planner.plan(instance.getFragment().getPlanNodeTree(), context, schemaRegion);
 
+                // 步骤4：创建执行驱动器
                 List<IDriver> drivers = new ArrayList<>();
                 driverFactories.forEach(factory -> drivers.add(factory.createDriver()));
                 context.initializeNumOfDrivers(drivers.size());
-                // get the sink of last driver
+                
+                // 步骤5：获取最后一个驱动器的接收器（通常是IdentitySinkOperator）
                 ISink sink = drivers.get(drivers.size() - 1).getSink();
 
+                // 步骤6：创建完整的执行实例
                 return createFragmentInstanceExecution(
                     scheduler,
                     instanceId,
@@ -280,8 +326,9 @@ public class FragmentInstanceManager {
                     false,
                     exchangeManager);
               } catch (Throwable t) {
+                // 步骤7：异常处理，清理资源并记录错误
                 clearFIRelatedResources(instanceId);
-                // deal with
+                // 处理特定错误类型
                 if (t instanceof IllegalStateException
                     && TOO_MANY_CONCURRENT_QUERIES_ERROR_MSG.equals(t.getMessage())) {
                   logger.warn(TOO_MANY_CONCURRENT_QUERIES_ERROR_MSG);
@@ -296,7 +343,10 @@ public class FragmentInstanceManager {
                 return null;
               }
             });
+    
+    // 步骤8：执行实例生命周期管理
     if (execution != null) {
+      // 添加状态变化监听器，执行完成后自动清理资源
       execution
           .getStateMachine()
           .addStateChangeListener(
@@ -307,6 +357,7 @@ public class FragmentInstanceManager {
               });
       return execution.getInstanceInfo();
     } else {
+      // 步骤9：执行失败时返回失败信息
       return createFailedInstanceInfo(instanceId);
     }
   }

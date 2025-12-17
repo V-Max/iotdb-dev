@@ -342,30 +342,78 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
     throw new UnsupportedOperationException("should call the concrete visitXX() method");
   }
 
+  /**
+   * 处理普通序列扫描节点，构建序列扫描操作符
+   * 该方法负责将SeriesScanNode转换为SeriesScanOperator，支持谓词下推优化
+   * 
+   * 示例查询：SELECT t1 AS ref0 FROM root.db0 WHERE t1 + 2 <= 10
+   * 在这个查询中，SeriesScanNode负责从设备root.db0中扫描时间序列t1的数据
+   * 
+   * 关键功能：
+   * 1. 构建序列扫描操作符
+   * 2. 处理谓词下推优化（将过滤条件推送到存储层）
+   * 3. 处理LIMIT和OFFSET下推
+   * 4. 根据谓词是否可下推选择不同的执行路径
+   * 
+   * 表1：visitSeriesScan与visitAlignedSeriesScan的区别
+   * | 特性 | visitSeriesScan | visitAlignedSeriesScan |
+   * |------|-----------------|------------------------|
+   * | 处理对象 | 普通时间序列 | 对齐时间序列 |
+   * | 路径类型 | PartialPath | AlignedPath |
+   * | 测量值数量 | 单个 | 多个 |
+   * | 存储结构 | 单独存储 | 对齐存储 |
+   * | 性能优化 | 单序列优化 | 多序列批量优化 |
+   * 
+   * 表2：执行路径选择逻辑
+   * | 条件组合 | 执行路径 | 操作符结构 | 性能影响 |
+   * |---------|---------|-----------|---------|
+   * | 谓词可下推 | 直接扫描 | SeriesScanOperator | 最优 |
+   * | 谓词不可下推 | 扫描后过滤 | FilterAndProjectOperator+Offset/Limit | 一般 |
+   * 
+   * @param node SeriesScanNode节点，包含序列扫描信息
+   * @param context 本地执行计划上下文
+   * @return 序列扫描操作符
+   */
   @Override
   public Operator visitSeriesScan(SeriesScanNode node, LocalExecutionPlanContext context) {
+    // 获取序列路径，包含设备路径和测量值
+    // 示例：对于查询 FROM root.db0.t1，seriesPath为root.db0.t1
     PartialPath seriesPath = node.getSeriesPath();
 
+    // 构建序列扫描选项构建器，用于配置扫描参数
     SeriesScanOptions.Builder scanOptionsBuilder = getSeriesScanOptionsBuilder(context);
+    
+    // 设置所有传感器（测量值）列表
+    // 示例：设置测量值列表为[t1]
     scanOptionsBuilder.withAllSensors(
         context.getAllSensors(seriesPath.getDevice(), seriesPath.getMeasurement()));
 
+    // 获取下推谓词（从查询优化器下推到扫描层的过滤条件）
+    // 示例：对于查询 WHERE t1 + 2 <= 10，pushDownPredicate可能是t1 + 2 <= 10
     Expression pushDownPredicate = node.getPushDownPredicate();
+    
+    // 检查谓词是否可以下推到扫描层（存储层）
+    // 简单谓词（如t1 > 5）可以下推，复杂谓词（如t1 + 2 <= 10）可能无法下推
     boolean predicateCanPushIntoScan = canPushIntoScan(pushDownPredicate);
+    
+    // 如果谓词存在且可以下推，将谓词转换为过滤器并下推到扫描选项
     if (pushDownPredicate != null && predicateCanPushIntoScan) {
       scanOptionsBuilder.withPushDownFilter(
           convertPredicateToFilter(
-              pushDownPredicate,
-              Collections.singletonList(node.getSeriesPath().getMeasurement()),
-              context.getTypeProvider().getTemplatedInfo() != null,
-              context.getTypeProvider(),
-              context.getZoneId()));
+              pushDownPredicate,                                        // 下推谓词
+              Collections.singletonList(node.getSeriesPath().getMeasurement()), // 测量值列表（单个）
+              context.getTypeProvider().getTemplatedInfo() != null,     // 是否使用模板
+              context.getTypeProvider(),                               // 类型提供者
+              context.getZoneId()));                                   // 时区ID
     }
+    
+    // 如果谓词为空或可以下推，将LIMIT和OFFSET也下推到扫描层
     if (pushDownPredicate == null || predicateCanPushIntoScan) {
-      scanOptionsBuilder.withPushDownLimit(node.getPushDownLimit());
-      scanOptionsBuilder.withPushDownOffset(node.getPushDownOffset());
+      scanOptionsBuilder.withPushDownLimit(node.getPushDownLimit());   // 下推LIMIT
+      scanOptionsBuilder.withPushDownOffset(node.getPushDownOffset()); // 下推OFFSET
     }
 
+    // 创建操作符上下文，用于管理操作符的执行状态
     OperatorContext operatorContext =
         context
             .getDriverContext()
@@ -373,33 +421,51 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
                 context.getNextOperatorId(),
                 node.getPlanNodeId(),
                 SeriesScanOperator.class.getSimpleName());
+    
+    // 记录序列路径信息到操作符上下文，便于调试和监控
     operatorContext.recordSpecifiedInfo("SeriesPath", seriesPath.getFullPath());
+    
+    // 创建序列扫描操作符
+    // 示例：创建用于扫描root.db0.t1的操作符
     SeriesScanOperator seriesScanOperator =
         new SeriesScanOperator(
-            operatorContext,
-            node.getPlanNodeId(),
-            seriesPath,
-            node.getScanOrder(),
-            scanOptionsBuilder.build());
+            operatorContext,              // 操作符上下文
+            node.getPlanNodeId(),         // 计划节点ID
+            seriesPath,                   // 序列路径
+            node.getScanOrder(),          // 扫描顺序（升序/降序）
+            scanOptionsBuilder.build());  // 构建的扫描选项
 
+    // 将扫描操作符添加到数据驱动上下文的源操作符列表中
     ((DataDriverContext) context.getDriverContext()).addSourceOperator(seriesScanOperator);
+    
+    // 将路径添加到数据驱动上下文中
     ((DataDriverContext) context.getDriverContext()).addPath(seriesPath);
+    
+    // 设置输入驱动标志为true，表示这是数据源操作符
     context.getDriverContext().setInputDriver(true);
 
+    // 如果谓词不能下推到扫描层，需要在扫描后应用过滤器
+    // 示例：对于复杂谓词t1 + 2 <= 10，通常无法下推，需要在此处理
     if (!predicateCanPushIntoScan) {
+      // 检查是否使用模板构建计划，当前不支持模板模式下的谓词下推
       checkState(!context.isBuildPlanUseTemplate(), "Push down predicate is not supported yet");
+      
+      // 构建过滤器操作符来处理不能下推的谓词
+      // 示例：为谓词t1 + 2 <= 10构建过滤器
       Operator rootOperator =
           constructFilterOperator(
-              pushDownPredicate,
-              seriesScanOperator,
+              pushDownPredicate,              // 下推谓词
+              seriesScanOperator,             // 扫描操作符
               Collections.singletonList(ExpressionFactory.timeSeries(node.getSeriesPath()))
-                  .toArray(new Expression[0]),
-              Collections.singletonList(node.getSeriesPath().getSeriesType()),
-              makeLayout(Collections.singletonList(node)),
-              false,
-              node.getPlanNodeId(),
-              node.getScanOrder(),
-              context);
+                  .toArray(new Expression[0]), // 表达式数组（单个时间序列表达式）
+              Collections.singletonList(node.getSeriesPath().getSeriesType()), // 数据类型列表
+              makeLayout(Collections.singletonList(node)), // 输入布局
+              false,                          // 是否保留空值
+              node.getPlanNodeId(),           // 计划节点ID
+              node.getScanOrder(),            // 扫描顺序
+              context);                       // 执行上下文
+
+      // 如果存在下推OFFSET，添加偏移操作符
       if (node.getPushDownOffset() > 0) {
         rootOperator =
             new OffsetOperator(
@@ -408,10 +474,12 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
                     .addOperatorContext(
                         context.getNextOperatorId(),
                         node.getPlanNodeId(),
-                        OffsetOperator.class.getSimpleName()),
-                node.getPushDownOffset(),
-                rootOperator);
+                        OffsetOperator.class.getSimpleName()), // 偏移操作符上下文
+                node.getPushDownOffset(),     // 偏移量
+                rootOperator);                // 输入操作符
       }
+      
+      // 如果存在下推LIMIT，添加限制操作符
       if (node.getPushDownLimit() > 0) {
         rootOperator =
             new LimitOperator(
@@ -420,43 +488,108 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
                     .addOperatorContext(
                         context.getNextOperatorId(),
                         node.getPlanNodeId(),
-                        LimitOperator.class.getSimpleName()),
-                node.getPushDownLimit(),
-                rootOperator);
+                        LimitOperator.class.getSimpleName()), // 限制操作符上下文
+                node.getPushDownLimit(),      // 限制数量
+                rootOperator);                // 输入操作符
       }
+      
+      // 返回包装后的操作符（包含过滤、偏移和限制）
       return rootOperator;
     }
+    
+    // 如果谓词可以下推，直接返回扫描操作符
+    // 示例：对于简单谓词t1 > 5，可以直接下推，不需要额外过滤
     return seriesScanOperator;
   }
 
+  /**
+   * 处理对齐序列扫描节点，构建对齐序列扫描操作符
+   * 该方法负责将AlignedSeriesScanNode转换为AlignedSeriesScanOperator，支持谓词下推优化
+   * 
+   * 示例查询：SELECT t1 AS ref0 FROM root.db0 WHERE t1 + 2 <= 10
+   * 在这个查询中，AlignedSeriesScanNode负责从对齐设备root.db0中扫描时间序列数据
+   * 
+   * 关键功能：
+   * 1. 构建对齐序列扫描操作符
+   * 2. 处理谓词下推优化（将过滤条件推送到存储层）
+   * 3. 处理LIMIT和OFFSET下推
+   * 4. 根据谓词是否可下推选择不同的执行路径
+   * 
+   * 数据结构变化：
+   * - 输入：AlignedSeriesScanNode（包含对齐路径、谓词等信息）
+   * - 输出：AlignedSeriesScanOperator或包装后的操作符
+   * - 关键数据结构：SeriesScanOptions包含扫描配置信息
+   * 
+   * 表1：谓词下推判断逻辑
+   * | 谓词类型 | 是否可下推 | 处理方式 | 示例 |
+   * |---------|-----------|---------|------|
+   * | 简单比较谓词 | 是 | 下推到存储层 | t1 > 5 |
+   * | 复杂表达式谓词 | 否 | 扫描后过滤 | t1 + 2 <= 10 |
+   * | 多条件AND/OR | 视情况 | 部分下推 | t1 > 5 AND t2 < 10 |
+   * | 包含UDF的谓词 | 否 | 扫描后过滤 | sin(t1) > 0.5 |
+   * 
+   * 表2：执行路径选择逻辑
+   * | 条件组合 | 执行路径 | 操作符结构 | 性能影响 |
+   * |---------|---------|-----------|---------|
+   * | 谓词可下推 | 直接扫描 | AlignedSeriesScanOperator | 最优 |
+   * | 谓词不可下推+模板 | 模板过滤 | FilterAndProjectOperator | 较好 |
+   * | 谓词不可下推+非模板 | 动态过滤 | FilterAndProjectOperator+Offset/Limit | 一般 |
+   * 
+   * 示例执行流程（SELECT t1 AS ref0 FROM root.db0 WHERE t1 + 2 <= 10）：
+   * 1. 获取对齐路径：root.db0，测量值列表：[t1]
+   * 2. 检查谓词t1 + 2 <= 10：复杂表达式，不可下推
+   * 3. 构建AlignedSeriesScanOperator扫描原始数据
+   * 4. 构建FilterAndProjectOperator处理过滤和投影
+   * 5. 返回包装后的操作符链
+   * 
+   * @param node AlignedSeriesScanNode节点，包含对齐序列扫描信息
+   * @param context 本地执行计划上下文
+   * @return 对齐序列扫描操作符
+   */
   @Override
   public Operator visitAlignedSeriesScan(
       AlignedSeriesScanNode node, LocalExecutionPlanContext context) {
+    // 获取对齐路径，包含设备路径和测量值列表
+    // 示例：对于查询 FROM root.db0，seriesPath包含root.db0和[t1]测量值
     AlignedPath seriesPath = node.getAlignedPath();
 
+    // 构建序列扫描选项构建器，用于配置扫描参数
     SeriesScanOptions.Builder scanOptionsBuilder = getSeriesScanOptionsBuilder(context);
+    
+    // 设置所有传感器（测量值）列表
+    // 示例：设置测量值列表为[t1]
     scanOptionsBuilder.withAllSensors(
         new HashSet<>(
             context.isBuildPlanUseTemplate()
-                ? context.getTemplatedInfo().getMeasurementList()
-                : seriesPath.getMeasurementList()));
+                ? context.getTemplatedInfo().getMeasurementList()  // 使用模板中的测量值列表
+                : seriesPath.getMeasurementList()));                // 使用路径中的测量值列表
 
+    // 获取下推谓词（从查询优化器下推到扫描层的过滤条件）
+    // 示例：对于查询 WHERE t1 + 2 <= 10，pushDownPredicate可能是t1 + 2 <= 10
     Expression pushDownPredicate = node.getPushDownPredicate();
+    
+    // 检查谓词是否可以下推到扫描层（存储层）
+    // 简单谓词（如t1 > 5）可以下推，复杂谓词（如t1 + 2 <= 10）可能无法下推
     boolean predicateCanPushIntoScan = canPushIntoScan(pushDownPredicate);
+    
+    // 如果谓词存在且可以下推，将谓词转换为过滤器并下推到扫描选项
     if (pushDownPredicate != null && predicateCanPushIntoScan) {
       scanOptionsBuilder.withPushDownFilter(
           convertPredicateToFilter(
-              pushDownPredicate,
-              node.getAlignedPath().getMeasurementList(),
-              context.getTypeProvider().getTemplatedInfo() != null,
-              context.getTypeProvider(),
-              context.getZoneId()));
+              pushDownPredicate,                           // 下推谓词
+              node.getAlignedPath().getMeasurementList(), // 测量值列表
+              context.getTypeProvider().getTemplatedInfo() != null, // 是否使用模板
+              context.getTypeProvider(),                  // 类型提供者
+              context.getZoneId()));                      // 时区ID
     }
+    
+    // 如果谓词为空或可以下推，将LIMIT和OFFSET也下推到扫描层
     if (pushDownPredicate == null || predicateCanPushIntoScan) {
-      scanOptionsBuilder.withPushDownLimit(node.getPushDownLimit());
-      scanOptionsBuilder.withPushDownOffset(node.getPushDownOffset());
+      scanOptionsBuilder.withPushDownLimit(node.getPushDownLimit());   // 下推LIMIT
+      scanOptionsBuilder.withPushDownOffset(node.getPushDownOffset()); // 下推OFFSET
     }
 
+    // 创建操作符上下文，用于管理操作符的执行状态
     OperatorContext operatorContext =
         context
             .getDriverContext()
@@ -465,7 +598,10 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
                 node.getPlanNodeId(),
                 AlignedSeriesScanOperator.class.getSimpleName());
 
+    // 获取最大TSBlock行数配置
     int maxTsBlockLineNum = TSFileDescriptor.getInstance().getConfig().getMaxTsBlockLineNumber();
+    
+    // 如果使用模板，根据模板中的LIMIT值调整最大行数
     if (context.getTypeProvider().getTemplatedInfo() != null) {
       maxTsBlockLineNum =
           (int)
@@ -473,58 +609,77 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
                   context.getTypeProvider().getTemplatedInfo().getLimitValue(), maxTsBlockLineNum);
     }
 
+    // 创建对齐序列扫描操作符
+    // 示例：创建用于扫描root.db0.t1的操作符
     AlignedSeriesScanOperator seriesScanOperator =
         new AlignedSeriesScanOperator(
-            operatorContext,
-            node.getPlanNodeId(),
-            seriesPath,
-            node.getScanOrder(),
-            scanOptionsBuilder.build(),
-            node.isQueryAllSensors(),
+            operatorContext,              // 操作符上下文
+            node.getPlanNodeId(),         // 计划节点ID
+            seriesPath,                   // 对齐路径
+            node.getScanOrder(),          // 扫描顺序（升序/降序）
+            scanOptionsBuilder.build(),   // 构建的扫描选项
+            node.isQueryAllSensors(),     // 是否查询所有传感器
             context.getTypeProvider().getTemplatedInfo() != null
-                ? context.getTypeProvider().getTemplatedInfo().getDataTypes()
-                : null,
-            maxTsBlockLineNum);
+                ? context.getTypeProvider().getTemplatedInfo().getDataTypes() // 模板数据类型
+                : null,                    // 非模板模式
+            maxTsBlockLineNum);           // 最大TSBlock行数
 
+    // 将扫描操作符添加到数据驱动上下文的源操作符列表中
     ((DataDriverContext) context.getDriverContext()).addSourceOperator(seriesScanOperator);
+    
+    // 将路径添加到数据驱动上下文中
     ((DataDriverContext) context.getDriverContext()).addPath(seriesPath);
+    
+    // 设置输入驱动标志为true，表示这是数据源操作符
     context.getDriverContext().setInputDriver(true);
 
+    // 如果谓词不能下推到扫描层，需要在扫描后应用过滤器
+    // 示例：对于复杂谓词t1 + 2 <= 10，通常无法下推，需要在此处理
     if (!predicateCanPushIntoScan) {
+      // 如果使用模板构建计划
       if (context.isBuildPlanUseTemplate()) {
         TemplatedInfo templatedInfo = context.getTemplatedInfo();
+        
+        // 使用模板信息构建过滤器操作符
         return constructFilterOperator(
-            pushDownPredicate,
-            seriesScanOperator,
-            templatedInfo.getProjectExpressions(),
-            templatedInfo.getDataTypes(),
-            templatedInfo.getFilterLayoutMap(),
-            templatedInfo.isKeepNull(),
-            node.getPlanNodeId(),
-            templatedInfo.getScanOrder(),
-            context);
+            pushDownPredicate,              // 下推谓词
+            seriesScanOperator,             // 扫描操作符
+            templatedInfo.getProjectExpressions(), // 模板中的投影表达式
+            templatedInfo.getDataTypes(),   // 模板中的数据类型
+            templatedInfo.getFilterLayoutMap(), // 模板中的过滤器布局映射
+            templatedInfo.isKeepNull(),     // 是否保留空值
+            node.getPlanNodeId(),           // 计划节点ID
+            templatedInfo.getScanOrder(),   // 扫描顺序
+            context);                       // 执行上下文
       }
 
+      // 非模板模式：构建表达式和数据类型列表
       AlignedPath alignedPath = node.getAlignedPath();
       List<Expression> expressions = new ArrayList<>();
       List<TSDataType> dataTypes = new ArrayList<>();
+      
+      // 为每个测量值创建时间序列表达式和对应的数据类型
+      // 示例：为测量值t1创建ExpressionFactory.timeSeries("root.db0.t1")
       for (int i = 0; i < alignedPath.getMeasurementList().size(); i++) {
         expressions.add(ExpressionFactory.timeSeries(alignedPath.getSubMeasurementPath(i)));
         dataTypes.add(alignedPath.getSubMeasurementDataType(i));
       }
 
+      // 构建过滤器操作符来处理不能下推的谓词
+      // 示例：为谓词t1 + 2 <= 10构建过滤器
       Operator rootOperator =
           constructFilterOperator(
-              pushDownPredicate,
-              seriesScanOperator,
-              expressions.toArray(new Expression[0]),
-              dataTypes,
-              makeLayout(Collections.singletonList(node)),
-              false,
-              node.getPlanNodeId(),
-              node.getScanOrder(),
-              context);
+              pushDownPredicate,              // 下推谓词
+              seriesScanOperator,             // 扫描操作符
+              expressions.toArray(new Expression[0]), // 表达式数组
+              dataTypes,                      // 数据类型列表
+              makeLayout(Collections.singletonList(node)), // 输入布局
+              false,                          // 是否保留空值
+              node.getPlanNodeId(),           // 计划节点ID
+              node.getScanOrder(),            // 扫描顺序
+              context);                       // 执行上下文
 
+      // 如果存在下推OFFSET，添加偏移操作符
       if (node.getPushDownOffset() > 0) {
         rootOperator =
             new OffsetOperator(
@@ -533,10 +688,12 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
                     .addOperatorContext(
                         context.getNextOperatorId(),
                         node.getPlanNodeId(),
-                        OffsetOperator.class.getSimpleName()),
-                node.getPushDownOffset(),
-                rootOperator);
+                        OffsetOperator.class.getSimpleName()), // 偏移操作符上下文
+                node.getPushDownOffset(),     // 偏移量
+                rootOperator);                // 输入操作符
       }
+      
+      // 如果存在下推LIMIT，添加限制操作符
       if (node.getPushDownLimit() > 0) {
         rootOperator =
             new LimitOperator(
@@ -545,12 +702,17 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
                     .addOperatorContext(
                         context.getNextOperatorId(),
                         node.getPlanNodeId(),
-                        LimitOperator.class.getSimpleName()),
-                node.getPushDownLimit(),
-                rootOperator);
+                        LimitOperator.class.getSimpleName()), // 限制操作符上下文
+                node.getPushDownLimit(),      // 限制数量
+                rootOperator);                // 输入操作符
       }
+      
+      // 返回包装后的操作符（包含过滤、偏移和限制）
       return rootOperator;
     }
+    
+    // 如果谓词可以下推，直接返回扫描操作符
+    // 示例：对于简单谓词t1 > 5，可以直接下推，不需要额外过滤
     return seriesScanOperator;
   }
 
@@ -1473,8 +1635,22 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
     return linearFill;
   }
 
+  /**
+   * 处理TransformNode节点，构建转换操作符
+   * 该方法负责将TransformNode转换为对应的执行操作符，支持两种模式：
+   * 1. 当所有投影表达式都可映射时，使用FilterAndProjectOperator（性能更优）
+   * 2. 当存在不可映射的UDF时，使用TransformOperator（功能更全）
+   * 
+   * 示例查询：SELECT t1 AS ref0 FROM root.db0 WHERE t1 + 2 <= 10
+   * 在这个查询中，TransformNode处理SELECT子句中的投影表达式（t1 AS ref0）
+   * 
+   * @param node TransformNode节点，包含投影表达式等信息
+   * @param context 本地执行计划上下文
+   * @return 转换操作符，用于执行投影操作
+   */
   @Override
   public Operator visitTransform(TransformNode node, LocalExecutionPlanContext context) {
+    // 创建操作符上下文，用于管理操作符的执行状态
     final OperatorContext operatorContext =
         context
             .getDriverContext()
@@ -1482,21 +1658,37 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
                 context.getNextOperatorId(),
                 node.getPlanNodeId(),
                 TransformOperator.class.getSimpleName());
+    
+    // 生成输入操作符（通常是数据源操作符）
     final Operator inputOperator = generateOnlyChildOperator(node, context);
+    
+    // 获取输入列的数据类型
     final List<TSDataType> inputDataTypes = getInputColumnTypes(node, context.getTypeProvider());
+    
+    // 构建输入布局，记录输入列的位置信息
     final Map<String, List<InputLocation>> inputLocations = makeLayout(node);
+    
+    // 获取投影表达式数组
     final Expression[] projectExpressions = node.getOutputExpressions();
+    
+    // 创建表达式类型映射，用于存储每个表达式的数据类型
     final Map<NodeRef<Expression>, TSDataType> expressionTypes = new HashMap<>();
 
+    // 分析每个投影表达式的类型
+    // 示例：对于查询 SELECT t1 AS ref0，projectExpressions包含[t1]
     for (Expression projectExpression : projectExpressions) {
       if (context.isBuildPlanUseTemplate()) {
+        // 使用模板信息分析表达式类型
         ExpressionTypeAnalyzer.analyzeExpressionUsingTemplatedInfo(
             expressionTypes, projectExpression, context.getTemplatedInfo());
       } else {
+        // 直接分析表达式类型
         ExpressionTypeAnalyzer.analyzeExpression(expressionTypes, projectExpression);
       }
     }
 
+    // 检查是否存在不可映射的UDF（用户定义函数）
+    // 不可映射的UDF需要更复杂的处理逻辑
     boolean hasNonMappableUDF = false;
     for (Expression expression : projectExpressions) {
       if (!expression.isMappable(expressionTypes)) {
@@ -1505,101 +1697,167 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
       }
     }
 
-    // Use FilterAndProject Operator when project expressions are all mappable
+    // 当所有投影表达式都可映射时，使用FilterAndProjectOperator（性能更优）
+    // 示例：SELECT t1 AS ref0 中的t1是可映射的简单表达式
     if (!hasNonMappableUDF) {
-      // init project UDTFContext
+      // 初始化项目UDTF上下文，用于管理UDF执行
       UDTFContext projectContext = new UDTFContext(context.getZoneId());
       projectContext.constructUdfExecutors(projectExpressions);
 
+      // 存储项目输出转换器列表
       List<ColumnTransformer> projectOutputTransformerList = new ArrayList<>();
+      
+      // 存储表达式到转换器的映射
       Map<Expression, ColumnTransformer> projectExpressionColumnTransformerMap = new HashMap<>();
 
-      // records LeafColumnTransformer of project expressions
+      // 记录项目表达式的叶子列转换器
       List<LeafColumnTransformer> projectLeafColumnTransformerList = new ArrayList<>();
 
+      // 创建列转换器访问者，用于构建表达式转换逻辑
       ColumnTransformerVisitor visitor = new ColumnTransformerVisitor();
+      
+      // 创建项目列转换器上下文
       ColumnTransformerVisitor.ColumnTransformerVisitorContext projectColumnTransformerContext =
           new ColumnTransformerVisitor.ColumnTransformerVisitorContext(
-              projectContext,
-              expressionTypes,
-              projectLeafColumnTransformerList,
-              inputLocations,
-              projectExpressionColumnTransformerMap,
-              ImmutableMap.of(),
-              ImmutableList.of(),
-              inputDataTypes,
-              inputLocations.size() - 1,
-              null);
+              projectContext,                    // UDTF上下文
+              expressionTypes,                   // 表达式类型映射
+              projectLeafColumnTransformerList,  // 叶子列转换器列表
+              inputLocations,                    // 输入布局
+              projectExpressionColumnTransformerMap, // 表达式到转换器的映射
+              ImmutableMap.of(),                 // 过滤器表达式映射（空）
+              ImmutableList.of(),                // 公共转换器列表（空）
+              inputDataTypes,                    // 输入数据类型
+              inputLocations.size() - 1,         // 输入位置索引
+              null);                             // 时间戳索引（null）
 
+      // 为每个投影表达式构建转换器
+      // 示例：为表达式t1构建ColumnTransformer
       for (Expression expression : projectExpressions) {
         projectOutputTransformerList.add(
             visitor.process(expression, projectColumnTransformerContext));
       }
 
+      // 返回FilterAndProjectOperator，该操作符同时处理过滤和投影
+      // 示例查询中，这里只处理投影（t1 AS ref0），没有过滤条件
       return new FilterAndProjectOperator(
-          operatorContext,
-          inputOperator,
-          inputDataTypes,
-          ImmutableList.of(),
-          null,
-          ImmutableList.of(),
-          projectLeafColumnTransformerList,
-          projectOutputTransformerList,
-          false,
-          false);
+          operatorContext,              // 操作符上下文
+          inputOperator,                // 输入操作符
+          inputDataTypes,               // 输入数据类型
+          ImmutableList.of(),           // 过滤器叶子转换器（空）
+          null,                         // 过滤器输出转换器（null）
+          ImmutableList.of(),           // 公共转换器（空）
+          projectLeafColumnTransformerList,  // 项目叶子转换器
+          projectOutputTransformerList, // 项目输出转换器
+          false,                        // 是否有不可映射UDF
+          false);                       // 是否启用过滤器
     }
 
+    // 当存在不可映射的UDF时，使用TransformOperator（功能更全但性能较低）
     try {
       return new TransformOperator(
-          operatorContext,
-          inputOperator,
-          inputDataTypes,
-          inputLocations,
-          node.getOutputExpressions(),
-          node.isKeepNull(),
-          context.getZoneId(),
-          expressionTypes,
-          node.getScanOrder() == ASC);
+          operatorContext,              // 操作符上下文
+          inputOperator,                // 输入操作符
+          inputDataTypes,               // 输入数据类型
+          inputLocations,               // 输入布局
+          node.getOutputExpressions(),  // 输出表达式
+          node.isKeepNull(),            // 是否保留空值
+          context.getZoneId(),          // 时区ID
+          expressionTypes,              // 表达式类型映射
+          node.getScanOrder() == ASC);  // 扫描顺序是否为升序
     } catch (QueryProcessException e) {
       throw new RuntimeException(e);
     }
   }
 
+  /**
+   * 处理FilterNode节点，构建过滤器操作符
+   * 该方法根据是否使用模板构建计划以及FilterNode的来源，选择不同的过滤器操作符构建方式：
+   * 1. 使用模板且FilterNode来自WHERE子句：使用模板信息构建过滤器
+   * 2. 不使用模板或FilterNode非WHERE来源：使用标准方式构建过滤器
+   * 
+   * 示例查询：SELECT t1 AS ref0 FROM root.db0 WHERE t1 + 2 <= 10
+   * 在这个查询中，FilterNode处理WHERE子句中的过滤条件（t1 + 2 <= 10）
+   * 
+   * 数据结构变化：
+   * - 输入：FilterNode（包含过滤表达式、输出表达式等信息）
+   * - 输出：FilterAndProjectOperator（同时处理过滤和投影）
+   * - 关键数据结构：过滤表达式被转换为ColumnTransformer，用于逐行过滤数据
+   * 
+   * @param node FilterNode节点，包含过滤表达式、输出表达式等信息
+   * @param context 本地执行计划上下文
+   * @return 过滤器操作符，用于执行数据过滤和投影
+   */
   @Override
   public Operator visitFilter(FilterNode node, LocalExecutionPlanContext context) {
+    // 检查是否使用模板构建计划且FilterNode来自WHERE子句
+    // 模板模式通常用于优化查询性能，特别是对于重复的查询模式
     if (context.isBuildPlanUseTemplate() && node.isFromWhere()) {
+      // 获取模板信息，包含预定义的表达式、数据类型和布局信息
       TemplatedInfo templatedInfo = context.getTemplatedInfo();
+      
+      // 使用模板信息构建过滤器操作符（适用于模板化查询）
+      // 示例查询 SELECT t1 AS ref0 FROM root.db0 WHERE t1 + 2 <= 10 如果使用模板会走这个分支
       return constructFilterOperator(
-          node.getPredicate(),
-          generateOnlyChildOperator(node, context),
-          templatedInfo.getProjectExpressions(),
-          templatedInfo.getDataTypes(),
-          templatedInfo.getFilterLayoutMap(),
-          templatedInfo.isKeepNull(),
-          node.getPlanNodeId(),
-          templatedInfo.getScanOrder(),
-          context);
+          node.getPredicate(),              // 过滤条件表达式（t1 + 2 <= 10）
+          generateOnlyChildOperator(node, context), // 生成输入操作符
+          templatedInfo.getProjectExpressions(), // 模板中的投影表达式
+          templatedInfo.getDataTypes(),     // 模板中的数据类型
+          templatedInfo.getFilterLayoutMap(), // 模板中的过滤器布局映射
+          templatedInfo.isKeepNull(),       // 是否保留空值
+          node.getPlanNodeId(),             // 计划节点ID
+          templatedInfo.getScanOrder(),     // 扫描顺序
+          context);                         // 执行上下文
     }
 
-    // 1. not use template
-    // 2. use template but the FilterNode is not generated by FilterNode
-    // the inputDataTypes should be generated by the outputColumns of children
+    // 以下情况使用标准方式构建过滤器：
+    // 1. 不使用模板构建计划
+    // 2. 使用模板但FilterNode不是由WHERE子句生成的
+    // 示例查询 SELECT t1 AS ref0 FROM root.db0 WHERE t1 + 2 <= 10 会走这个分支
+    
+    // 输入数据类型应该由子节点的输出列生成
     return constructFilterOperator(
-        node.getPredicate(),
-        generateOnlyChildOperator(node, context),
-        node.getOutputExpressions(),
-        node.getChildren().stream()
-            .map(PlanNode::getOutputColumnNames)
-            .flatMap(List::stream)
-            .map(context.getTypeProvider()::getType)
-            .collect(Collectors.toList()),
-        makeLayout(node),
-        node.isKeepNull(),
-        node.getPlanNodeId(),
-        node.getScanOrder(),
-        context);
+        node.getPredicate(),              // 过滤条件表达式（t1 + 2 <= 10）
+        generateOnlyChildOperator(node, context), // 生成输入操作符
+        node.getOutputExpressions(),      // 节点的输出表达式
+        node.getChildren().stream()       // 从子节点获取输出列的数据类型
+            .map(PlanNode::getOutputColumnNames) // 获取每个子节点的输出列名
+            .flatMap(List::stream)        // 扁平化为列名流
+            .map(context.getTypeProvider()::getType) // 获取每个列的数据类型
+            .collect(Collectors.toList()), // 收集为数据类型列表
+        makeLayout(node),                 // 构建输入布局
+        node.isKeepNull(),                // 是否保留空值
+        node.getPlanNodeId(),             // 计划节点ID
+        node.getScanOrder(),              // 扫描顺序
+        context);                         // 执行上下文
   }
 
+  /**
+   * 构建过滤器操作符的核心方法
+   * 该方法负责将过滤条件和投影表达式转换为可执行的操作符，支持两种处理模式：
+   * 1. 当投影表达式都可映射时：直接返回FilterAndProjectOperator
+   * 2. 当投影表达式包含不可映射UDF时：包装TransformOperator进行进一步计算
+   * 
+   * 示例查询：SELECT t1 AS ref0 FROM root.db0 WHERE t1 + 2 <= 10
+   * - predicate: t1 + 2 <= 10（过滤条件）
+   * - projectExpressions: [t1]（投影表达式）
+   * - inputDataTypes: [INT32]（输入数据类型）
+   * 
+   * 数据结构变化：
+   * 1. 表达式分析：将过滤和投影表达式解析为类型信息
+   * 2. 转换器构建：创建ColumnTransformer用于表达式计算
+   * 3. 操作符生成：构建FilterAndProjectOperator或TransformOperator
+   * 
+   * @param predicate 过滤条件表达式
+   * @param inputOperator 输入操作符
+   * @param projectExpressions 投影表达式数组
+   * @param inputDataTypes 输入数据类型列表
+   * @param inputLocations 输入位置映射
+   * @param isKeepNull 是否保留空值
+   * @param planNodeId 计划节点ID
+   * @param scanOrder 扫描顺序
+   * @param context 本地执行计划上下文
+   * @return 构建的过滤器操作符
+   */
   private Operator constructFilterOperator(
       Expression predicate,
       Operator inputOperator,
@@ -1610,21 +1868,31 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
       PlanNodeId planNodeId,
       Ordering scanOrder,
       LocalExecutionPlanContext context) {
+    // 创建表达式类型映射，用于存储每个表达式的数据类型
     final Map<NodeRef<Expression>, TSDataType> expressionTypes = new HashMap<>();
+    
+    // 分析过滤条件表达式的类型
+    // 示例：对于表达式 t1 + 2 <= 10，分析其各组成部分的数据类型
     if (context.isBuildPlanUseTemplate()) {
+      // 使用模板信息分析表达式类型（适用于模板化查询）
       ExpressionTypeAnalyzer.analyzeExpressionUsingTemplatedInfo(
           expressionTypes, predicate, context.getTypeProvider().getTemplatedInfo());
     } else {
+      // 直接分析表达式类型（适用于普通查询）
       ExpressionTypeAnalyzer.analyzeExpression(expressionTypes, predicate);
     }
 
-    // check whether predicate contains Non-Mappable UDF
+    // 检查过滤条件是否包含不可映射的UDF（用户定义函数）
+    // 过滤器不允许包含不可映射的UDF，因为这会严重影响性能
     if (!predicate.isMappable(expressionTypes)) {
       throw new UnsupportedOperationException("Filter can not contain Non-Mappable UDF");
     }
 
+    // 复制输入数据类型作为过滤器输出数据类型
     final List<TSDataType> filterOutputDataTypes = new ArrayList<>(inputDataTypes);
 
+    // 分析每个投影表达式的类型
+    // 示例：对于投影表达式 t1，分析其数据类型
     for (Expression projectExpression : projectExpressions) {
       if (context.isBuildPlanUseTemplate()) {
         ExpressionTypeAnalyzer.analyzeExpressionUsingTemplatedInfo(
@@ -1634,6 +1902,7 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
       }
     }
 
+    // 检查投影表达式是否包含不可映射的UDF
     boolean hasNonMappableUdf = false;
     for (Expression expression : projectExpressions) {
       if (!expression.isMappable(expressionTypes)) {
@@ -1642,69 +1911,79 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
       }
     }
 
-    // init UDTFContext
+    // 初始化过滤器UDTF上下文，用于管理UDF执行
     UDTFContext filterContext = new UDTFContext(context.getZoneId());
     filterContext.constructUdfExecutors(new Expression[] {predicate});
 
-    // records LeafColumnTransformer of filter
+    // 记录过滤器的叶子列转换器（用于处理基础列引用）
     List<LeafColumnTransformer> filterLeafColumnTransformerList = new ArrayList<>();
 
-    // records common ColumnTransformer between filter and project expressions
+    // 记录过滤器和投影表达式之间的公共转换器（用于优化重复计算）
     List<ColumnTransformer> commonTransformerList = new ArrayList<>();
 
-    // records LeafColumnTransformer of project expressions
+    // 记录投影表达式的叶子列转换器
     List<LeafColumnTransformer> projectLeafColumnTransformerList = new ArrayList<>();
 
-    // records subexpression -> ColumnTransformer for filter
+    // 记录子表达式到转换器的映射（用于避免重复构建相同的转换器）
     Map<Expression, ColumnTransformer> filterExpressionColumnTransformerMap = new HashMap<>();
 
+    // 创建列转换器访问者，用于构建表达式转换逻辑
     ColumnTransformerVisitor visitor = new ColumnTransformerVisitor();
 
+    // 创建过滤器列转换器上下文
     ColumnTransformerVisitor.ColumnTransformerVisitorContext filterColumnTransformerContext =
         new ColumnTransformerVisitor.ColumnTransformerVisitorContext(
-            filterContext,
-            expressionTypes,
-            filterLeafColumnTransformerList,
-            inputLocations,
-            filterExpressionColumnTransformerMap,
-            ImmutableMap.of(),
-            ImmutableList.of(),
-            ImmutableList.of(),
-            0,
-            null);
+            filterContext,                    // UDTF上下文
+            expressionTypes,                  // 表达式类型映射
+            filterLeafColumnTransformerList,  // 过滤器叶子转换器列表
+            inputLocations,                   // 输入布局
+            filterExpressionColumnTransformerMap, // 过滤器表达式到转换器的映射
+            ImmutableMap.of(),                // 过滤器表达式映射（空）
+            ImmutableList.of(),               // 公共转换器列表（空）
+            ImmutableList.of(),               // 输入数据类型列表（空）
+            0,                                // 输入位置索引
+            null);                            // 时间戳索引（null）
 
+    // 处理过滤条件表达式，构建过滤器输出转换器
+    // 示例：将表达式 t1 + 2 <= 10 转换为ColumnTransformer
     ColumnTransformer filterOutputTransformer =
         visitor.process(predicate, filterColumnTransformerContext);
 
+    // 存储项目输出转换器列表
     List<ColumnTransformer> projectOutputTransformerList = new ArrayList<>();
 
+    // 存储项目表达式到转换器的映射
     Map<Expression, ColumnTransformer> projectExpressionColumnTransformerMap = new HashMap<>();
 
-    // init project transformer when project expressions are all mappable
+    // 当所有投影表达式都可映射时，初始化项目转换器
     if (!hasNonMappableUdf) {
-      // init project UDTFContext
+      // 初始化项目UDTF上下文
       UDTFContext projectContext = new UDTFContext(context.getZoneId());
       projectContext.constructUdfExecutors(projectExpressions);
 
+      // 创建项目列转换器上下文
       ColumnTransformerVisitor.ColumnTransformerVisitorContext projectColumnTransformerContext =
           new ColumnTransformerVisitor.ColumnTransformerVisitorContext(
-              projectContext,
-              expressionTypes,
-              projectLeafColumnTransformerList,
-              inputLocations,
-              projectExpressionColumnTransformerMap,
-              filterExpressionColumnTransformerMap,
-              commonTransformerList,
-              filterOutputDataTypes,
-              inputLocations.size() - 1,
-              null);
+              projectContext,                    // UDTF上下文
+              expressionTypes,                   // 表达式类型映射
+              projectLeafColumnTransformerList,  // 项目叶子转换器列表
+              inputLocations,                    // 输入布局
+              projectExpressionColumnTransformerMap, // 项目表达式到转换器的映射
+              filterExpressionColumnTransformerMap, // 过滤器表达式映射（用于重用）
+              commonTransformerList,             // 公共转换器列表
+              filterOutputDataTypes,             // 过滤器输出数据类型
+              inputLocations.size() - 1,         // 输入位置索引
+              null);                             // 时间戳索引（null）
 
+      // 为每个投影表达式构建转换器
+      // 示例：为表达式 t1 构建ColumnTransformer
       for (Expression expression : projectExpressions) {
         projectOutputTransformerList.add(
             visitor.process(expression, projectColumnTransformerContext));
       }
     }
 
+    // 创建操作符上下文，用于管理操作符的执行状态
     final OperatorContext operatorContext =
         context
             .getDriverContext()
@@ -1712,25 +1991,30 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
                 context.getNextOperatorId(),
                 planNodeId,
                 FilterAndProjectOperator.class.getSimpleName());
+    
+    // 构建FilterAndProjectOperator，该操作符同时处理过滤和投影
+    // 示例查询中，该操作符会处理 WHERE t1 + 2 <= 10 和 SELECT t1 AS ref0
     Operator filter =
         new FilterAndProjectOperator(
-            operatorContext,
-            inputOperator,
-            filterOutputDataTypes,
-            filterLeafColumnTransformerList,
-            filterOutputTransformer,
-            commonTransformerList,
-            projectLeafColumnTransformerList,
-            projectOutputTransformerList,
-            hasNonMappableUdf,
-            true);
+            operatorContext,              // 操作符上下文
+            inputOperator,                // 输入操作符
+            filterOutputDataTypes,        // 过滤器输出数据类型
+            filterLeafColumnTransformerList,  // 过滤器叶子转换器
+            filterOutputTransformer,      // 过滤器输出转换器
+            commonTransformerList,        // 公共转换器
+            projectLeafColumnTransformerList,  // 项目叶子转换器
+            projectOutputTransformerList, // 项目输出转换器
+            hasNonMappableUdf,            // 是否有不可映射UDF
+            true);                        // 启用过滤器
 
-    // Project expressions don't contain Non-Mappable UDF, TransformOperator is not needed
+    // 当投影表达式不包含不可映射UDF时，直接返回FilterAndProjectOperator
+    // 示例查询 SELECT t1 AS ref0 FROM root.db0 WHERE t1 + 2 <= 10 会走这个分支
     if (!hasNonMappableUdf) {
       return filter;
     }
 
-    // has Non-Mappable UDF, we wrap a TransformOperator for further calculation
+    // 当投影表达式包含不可映射UDF时，包装TransformOperator进行进一步计算
+    // 这种情况适用于包含复杂UDF的查询
     try {
       final OperatorContext transformContext =
           context
@@ -1738,15 +2022,15 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
               .addOperatorContext(
                   context.getNextOperatorId(), planNodeId, TransformOperator.class.getSimpleName());
       return new TransformOperator(
-          transformContext,
-          filter,
-          inputDataTypes,
-          inputLocations,
-          projectExpressions,
-          isKeepNull,
-          context.getZoneId(),
-          expressionTypes,
-          scanOrder == ASC);
+          transformContext,               // 转换操作符上下文
+          filter,                         // 输入操作符（过滤器）
+          inputDataTypes,                 // 输入数据类型
+          inputLocations,                 // 输入布局
+          projectExpressions,             // 投影表达式
+          isKeepNull,                     // 是否保留空值
+          context.getZoneId(),            // 时区ID
+          expressionTypes,                // 表达式类型映射
+          scanOrder == ASC);              // 扫描顺序是否为升序
     } catch (QueryProcessException e) {
       throw new RuntimeException(e);
     }
@@ -2639,33 +2923,71 @@ public class OperatorTreeGenerator extends PlanVisitor<Operator, LocalExecutionP
     return exchangeOperator;
   }
 
+  /**
+   * 处理IdentitySinkNode节点，构建身份接收操作符
+   * 
+   * 该方法将IdentitySinkNode计划节点转换为IdentitySinkOperator操作符，用于标识查询计划的最终输出位置
+   * 
+   * 示例查询：SELECT t1 AS ref0 FROM root.db0 WHERE t1 + 2 <= 10
+   * 在这个查询中，IdentitySinkNode作为查询计划的最终输出节点，负责接收处理后的数据
+   * 
+   * 表1：visitIdentitySink方法执行流程
+   * | 步骤 | 功能描述 | 关键数据结构变化 | 示例 |
+   * |------|---------|-----------------|------|
+   * | 1. 初始化 | 增加交换操作符计数 | ExchangeSumNum +1 | 统计分布式查询中的交换操作 |
+   * | 2. 创建操作符上下文 | 构建操作符执行环境 | PlanNode → OperatorContext | 为IdentitySinkOperator创建执行上下文 |
+   * | 3. 创建接收句柄 | 构建数据接收通道 | 创建ShuffleSinkHandle | 管理数据发送到下游节点 |
+   * | 4. 处理子节点 | 递归处理所有子节点 | PlanNode列表 → Operator列表 | 处理SeriesScanOperator等子操作符 |
+   * | 5. 配置接收句柄 | 设置内存限制 | 配置最大字节数 | 控制数据传输的内存使用 |
+   * | 6. 创建操作符 | 实例化IdentitySinkOperator | 组装所有组件 | 生成最终的操作符实例 |
+   * 
+   * 表2：IdentitySinkOperator在查询执行中的角色
+   * | 查询阶段 | 操作符类型 | 功能描述 | 数据流向 |
+   * |---------|-----------|---------|---------|
+   * | 数据扫描 | SeriesScanOperator | 扫描原始时间序列数据 | 原始数据 → 过滤操作符 |
+   * | 数据处理 | FilterAndProjectOperator | 应用过滤条件和投影 | 过滤数据 → 接收操作符 |
+   * | 数据输出 | IdentitySinkOperator | 最终数据输出 | 处理结果 → 客户端 |
+   * 
+   * @param node IdentitySinkNode计划节点
+   * @param context 本地执行计划上下文
+   * @return IdentitySinkOperator操作符实例
+   */
   @Override
   public Operator visitIdentitySink(IdentitySinkNode node, LocalExecutionPlanContext context) {
+    // 步骤1：增加交换操作符计数，用于统计分布式查询中的交换操作
     context.addExchangeSumNum(1);
+    
+    // 步骤2：创建操作符上下文，为IdentitySinkOperator提供执行环境
     OperatorContext operatorContext =
         context
             .getDriverContext()
             .addOperatorContext(
-                context.getNextOperatorId(),
-                node.getPlanNodeId(),
-                IdentitySinkOperator.class.getSimpleName());
+                context.getNextOperatorId(),        // 获取下一个操作符ID
+                node.getPlanNodeId(),               // 使用节点的计划ID
+                IdentitySinkOperator.class.getSimpleName()); // 操作符类型名称
 
+    // 步骤3：创建数据接收句柄，用于管理数据发送到下游节点
     checkArgument(
         MPP_DATA_EXCHANGE_MANAGER != null, "MPP_DATA_EXCHANGE_MANAGER should not be null");
     FragmentInstanceId localInstanceId = context.getInstanceContext().getId();
     DownStreamChannelIndex downStreamChannelIndex = new DownStreamChannelIndex(0);
     ISinkHandle sinkHandle =
         MPP_DATA_EXCHANGE_MANAGER.createShuffleSinkHandle(
-            node.getDownStreamChannelLocationList(),
-            downStreamChannelIndex,
-            ShuffleSinkHandle.ShuffleStrategyEnum.PLAIN,
-            localInstanceId.toThrift(),
-            node.getPlanNodeId().getId(),
-            context.getInstanceContext());
+            node.getDownStreamChannelLocationList(), // 下游通道位置列表
+            downStreamChannelIndex,                  // 下游通道索引
+            ShuffleSinkHandle.ShuffleStrategyEnum.PLAIN, // 使用普通策略
+            localInstanceId.toThrift(),              // 本地实例ID
+            node.getPlanNodeId().getId(),            // 节点ID
+            context.getInstanceContext());           // 实例上下文
+            
+    // 步骤4：递归处理所有子节点，将PlanNode转换为Operator
     List<Operator> children = dealWithConsumeChildrenOneByOneNode(node, context);
+    
+    // 步骤5：配置接收句柄的内存限制
     sinkHandle.setMaxBytesCanReserve(context.getMaxBytesOneHandleCanReserve());
     context.getDriverContext().setSink(sinkHandle);
 
+    // 步骤6：创建并返回IdentitySinkOperator实例
     return new IdentitySinkOperator(operatorContext, children, downStreamChannelIndex, sinkHandle);
   }
 
